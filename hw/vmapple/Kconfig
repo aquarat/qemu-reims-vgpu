@@ -3,6 +3,9 @@
 config VMAPPLE_AES
     bool
 
+config VMAPPLE_AVP_RTC
+    bool
+
 config VMAPPLE_BDIF
     bool
 
@@ -28,6 +31,7 @@ config VMAPPLE
     select GPIO_PWR
     select PVPANIC_MMIO
     select VMAPPLE_AES
+    select VMAPPLE_AVP_RTC
     select VMAPPLE_BDIF
     select VMAPPLE_CFG
     imply MAC_PVG_MMIO

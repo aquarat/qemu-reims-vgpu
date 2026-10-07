@@ -74,6 +74,7 @@ struct VMAppleMachineState {
     MemoryRegion ecam_alias;
     uint64_t uuid;
     char *gfx_device;
+    bool avp_rtc;
 };
 
 #define TYPE_VMAPPLE_MACHINE   MACHINE_TYPE_NAME("vmapple")
@@ -113,6 +114,7 @@ enum {
     VMAPPLE_APV_IOSFC,
     VMAPPLE_AES_1,
     VMAPPLE_AES_2,
+    VMAPPLE_AVP_RTC,
     VMAPPLE_BDOOR,
     VMAPPLE_MEMMAP_LAST,
 };
@@ -134,6 +136,7 @@ static const MemMapEntry memmap[] = {
     [VMAPPLE_APV_IOSFC] =          { 0x30210000, 0x00010000 },
     [VMAPPLE_AES_1] =              { 0x30220000, 0x00004000 },
     [VMAPPLE_AES_2] =              { 0x30230000, 0x00004000 },
+    [VMAPPLE_AVP_RTC] =            { 0x30240000, 0x00001000 },
     [VMAPPLE_PCIE_ECAM] =          { 0x40000000, 0x10000000 },
     [VMAPPLE_PCIE_MMIO] =          { 0x50000000, 0x1fff0000 },
 
@@ -148,6 +151,7 @@ static const int irqmap[] = {
     [VMAPPLE_APV_IOSFC] = 0x10,
     [VMAPPLE_APV_GFX] = 0x11,
     [VMAPPLE_AES_1] = 0x12,
+    [VMAPPLE_AVP_RTC] = 0x13,
     [VMAPPLE_PCIE] = 0x20,
     [VMAPPLE_GICV2M] = 0x80
 };
@@ -246,6 +250,17 @@ static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
     sysbus_connect_irq(gfx, 0, qdev_get_gpio_in(vms->gic, irq_gfx));
     sysbus_connect_irq(gfx, 1, qdev_get_gpio_in(vms->gic, irq_iosfc));
     sysbus_realize_and_unref(gfx, &error_fatal);
+}
+
+/*
+ * The avp,rtc clock. iBoot keeps the guest's avp-rtc device tree node (and
+ * deletes pl031-rtc) when this device answers its ID probe; the PL031 stays
+ * mapped for guests and booters that do not probe.
+ */
+static void create_avp_rtc(VMAppleMachineState *vms)
+{
+    sysbus_create_simple(TYPE_VMAPPLE_AVP_RTC, vms->memmap[VMAPPLE_AVP_RTC].base,
+                         qdev_get_gpio_in(vms->gic, vms->irqmap[VMAPPLE_AVP_RTC]));
 }
 
 static void create_aes(VMAppleMachineState *vms, MemoryRegion *mem)
@@ -587,6 +602,9 @@ static void mach_vmapple_init(MachineState *machine)
     create_gfx(vms, sysmem);
     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
     create_rtc(vms);
+    if (vms->avp_rtc) {
+        create_avp_rtc(vms);
+    }
     create_pcie(vms);
 
     create_gpio_devices(vms, VMAPPLE_GPIO, sysmem);
@@ -711,12 +729,23 @@ static void vmapple_set_gfx_device(Object *obj, const char *value,
     vms->gfx_device = g_strdup(value);
 }
 
+static bool vmapple_get_avp_rtc(Object *obj, Error **errp)
+{
+    return VMAPPLE_MACHINE(obj)->avp_rtc;
+}
+
+static void vmapple_set_avp_rtc(Object *obj, bool value, Error **errp)
+{
+    VMAPPLE_MACHINE(obj)->avp_rtc = value;
+}
+
 static void vmapple_instance_init(Object *obj)
 {
     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
 
     vms->irqmap = irqmap;
     vms->gfx_device = g_strdup("apple-gfx-mmio");
+    vms->avp_rtc = true;
 
     object_property_add_uint64_ptr(obj, "uuid", &vms->uuid,
                                    OBJ_PROP_FLAG_READWRITE);
@@ -726,6 +755,11 @@ static void vmapple_instance_init(Object *obj)
     object_property_set_description(obj, "gfx-device",
                                     "Paravirt GPU device backing the Reims VGPU "
                                     "slots (apple-gfx-mmio | reims-vgpu-mmio)");
+    object_property_add_bool(obj, "avp-rtc", vmapple_get_avp_rtc,
+                             vmapple_set_avp_rtc);
+    object_property_set_description(obj, "avp-rtc",
+                                    "Provide the avp,rtc clock macOS expects "
+                                    "(default on; off leaves only the PL031)");
 }
 
 static void vmapple_instance_finalize(Object *obj)
