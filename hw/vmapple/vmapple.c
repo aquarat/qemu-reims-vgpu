@@ -15,6 +15,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/target-info.h"
 #include "qemu/bitops.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
@@ -33,7 +34,6 @@
 #include "hw/usb/usb.h"
 #include "hw/arm/bsa.h"
 #include "hw/arm/boot.h"
-#include "hw/arm/machines-qom.h"
 #include "hw/char/pl011.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
@@ -742,7 +742,7 @@ static const TypeInfo vmapple_machine_info = {
     .class_init    = vmapple_machine_class_init,
     .instance_init = vmapple_instance_init,
     .instance_finalize = vmapple_instance_finalize,
-    .interfaces    = aarch64_machine_interfaces
+    .is_available  = target_aarch64,
 };
 
 static void machvmapple_machine_init(void)
