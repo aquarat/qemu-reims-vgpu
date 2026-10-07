@@ -131,36 +131,12 @@ static void tegra241_cmdqv_reset_vcmdq_cache(Tegra241CMDQV *cmdqv, int index)
 
 static void tegra241_cmdqv_guest_unmap_vintf_page0(Tegra241CMDQV *cmdqv)
 {
-    if (!cmdqv->mr_vintf_page0) {
-        return;
-    }
-
-    memory_region_del_subregion(&cmdqv->mmio_cmdqv, cmdqv->mr_vintf_page0);
-    object_unparent(OBJECT(cmdqv->mr_vintf_page0));
-    g_free(cmdqv->mr_vintf_page0);
-    cmdqv->mr_vintf_page0 = NULL;
+    memory_region_set_enabled(&cmdqv->mr_vintf_page0, false);
 }
 
 static void tegra241_cmdqv_guest_map_vintf_page0(Tegra241CMDQV *cmdqv)
 {
-    char *name;
-
-    if (cmdqv->mr_vintf_page0) {
-        return;
-    }
-
-    name = g_strdup_printf("%s vintf-page0",
-                           memory_region_name(&cmdqv->mmio_cmdqv));
-    cmdqv->mr_vintf_page0 = g_malloc0(sizeof(*cmdqv->mr_vintf_page0));
-    memory_region_init_ram_device_ptr(cmdqv->mr_vintf_page0,
-                                      memory_region_owner(&cmdqv->mmio_cmdqv),
-                                      name, VINTF_PAGE_SIZE,
-                                      cmdqv->vintf_page0);
-    memory_region_set_skip_iommu_map(cmdqv->mr_vintf_page0, true);
-    memory_region_add_subregion_overlap(&cmdqv->mmio_cmdqv,
-                                        CMDQV_VINTF_PAGE0_BASE,
-                                        cmdqv->mr_vintf_page0, 1);
-    g_free(name);
+    memory_region_set_enabled(&cmdqv->mr_vintf_page0, true);
 }
 
 static void tegra241_cmdqv_free_vcmdq(Tegra241CMDQV *cmdqv, int index)
@@ -212,7 +188,9 @@ static inline uint32_t *tegra241_cmdqv_vintf_lvcmdq_ptr(Tegra241CMDQV *cmdqv,
 /*
  * Flush cached register writes into the mmap'd host VINTF page0 after a
  * successful HW_QUEUE_ALLOC, so the guest's earlier writes survive
- * the cache-to-hardware transition.
+ * the cache-to-hardware transition. GERRORN is intentionally not synced,
+ * as overwriting it with the cached value could recreate a GERROR != GERRORN
+ * mismatch and stall the VCMDQ.
  */
 static void tegra241_cmdqv_sync_vcmdq(Tegra241CMDQV *cmdqv, int index)
 {
@@ -229,9 +207,6 @@ static void tegra241_cmdqv_sync_vcmdq(Tegra241CMDQV *cmdqv, int index)
 
     ptr = tegra241_cmdqv_vintf_lvcmdq_ptr(cmdqv, index, A_VCMDQ0_CONFIG);
     *ptr = cmdqv->vcmdq_config[index];
-
-    ptr = tegra241_cmdqv_vintf_lvcmdq_ptr(cmdqv, index, A_VCMDQ0_GERRORN);
-    *ptr = cmdqv->vcmdq_gerrorn[index];
 }
 
 /*
@@ -841,12 +816,17 @@ static void tegra241_cmdqv_event_read(void *opaque)
         struct iommu_vevent_tegra241_cmdqv vevent;
     } buf;
     Error *local_err = NULL;
+    int ret;
 
-    if (!smmuv3_accel_event_read_validate(veventq,
-                                          IOMMU_VEVENTQ_TYPE_TEGRA241_CMDQV,
-                                          &buf, sizeof(buf), &local_err)) {
+    ret = smmuv3_accel_event_read_validate(veventq,
+                                           IOMMU_VEVENTQ_TYPE_TEGRA241_CMDQV,
+                                           &buf, sizeof(buf), &local_err);
+    if (ret < 0) {
         warn_report_err_once(local_err);
         return;
+    }
+    if (ret > 0) {
+        return; /* EAGAIN/EINTR */
     }
 
     if (buf.vevent.lvcmdq_err_map[0] || buf.vevent.lvcmdq_err_map[1]) {
@@ -895,6 +875,9 @@ static void tegra241_cmdqv_free_viommu(SMMUv3State *s)
         cmdqv->veventq = NULL;
     }
     if (cmdqv->vintf_page0) {
+        memory_region_del_subregion(&cmdqv->mmio_cmdqv,
+                                    &cmdqv->mr_vintf_page0);
+        object_unparent(OBJECT(&cmdqv->mr_vintf_page0));
         munmap(cmdqv->vintf_page0, VINTF_PAGE_SIZE);
         cmdqv->vintf_page0 = NULL;
     }
@@ -906,6 +889,7 @@ tegra241_cmdqv_alloc_viommu(SMMUv3State *s, HostIOMMUDeviceIOMMUFD *idev,
                             uint32_t *out_viommu_id, Error **errp)
 {
     Tegra241CMDQV *cmdqv = s->s_accel->cmdqv;
+    char *name;
     uint32_t viommu_id, veventq_id, veventq_fd;
     IOMMUFDVeventq *veventq;
     int flags;
@@ -951,6 +935,28 @@ tegra241_cmdqv_alloc_viommu(SMMUv3State *s, HostIOMMUDeviceIOMMUFD *idev,
 
     /* Set up event handler for veventq fd */
     qemu_set_fd_handler(veventq_fd, tegra241_cmdqv_event_read, NULL, cmdqv);
+
+    /*
+     * Tie the MemoryRegion lifetime to the VINTF page0 mmap. Initialize it
+     * disabled. If initial vIOMMU setup later unwinds, the region has never
+     * entered a FlatView and can be removed and unparented before releasing
+     * the mmap. After successful setup, keep it parented across guest disable
+     * and reset, and only toggle its enabled state so old FlatViews continue
+     * to reference valid storage.
+     */
+    name = g_strdup_printf("%s vintf-page0",
+                           memory_region_name(&cmdqv->mmio_cmdqv));
+    memory_region_init_ram_device_ptr(&cmdqv->mr_vintf_page0,
+                                      memory_region_owner(&cmdqv->mmio_cmdqv),
+                                      name, VINTF_PAGE_SIZE,
+                                      cmdqv->vintf_page0);
+    memory_region_set_skip_iommu_map(&cmdqv->mr_vintf_page0, true);
+    memory_region_set_enabled(&cmdqv->mr_vintf_page0, false);
+    memory_region_add_subregion_overlap(&cmdqv->mmio_cmdqv,
+                                        CMDQV_VINTF_PAGE0_BASE,
+                                        &cmdqv->mr_vintf_page0, 1);
+    g_free(name);
+
     *out_viommu_id = viommu_id;
     return true;
 

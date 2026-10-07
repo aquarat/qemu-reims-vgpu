@@ -44,7 +44,7 @@ int kvm_on_sigbus(int code, void *addr)
     return 1;
 }
 
-int kvm_irqchip_add_msi_route(KVMRouteChange *c, int vector, PCIDevice *dev)
+int kvm_irqchip_add_msi_route(AccelRouteChange *c, int vector, PCIDevice *dev)
 {
     return -ENOSYS;
 }
@@ -141,5 +141,11 @@ bool kvm_hwpoisoned_mem(void)
 
 int kvm_create_guest_memfd(uint64_t size, uint64_t flags, Error **errp)
 {
+    error_setg(errp, "KVM is not enabled");
     return -ENOSYS;
+}
+
+bool kvm_private_memory_attribute_supported(void)
+{
+    return false;
 }

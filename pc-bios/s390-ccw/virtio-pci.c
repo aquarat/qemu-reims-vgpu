@@ -21,7 +21,6 @@ VirtioPciCap c_cap; /* Common capabilities  */
 VirtioPciCap d_cap; /* Device capabilities  */
 VirtioPciCap n_cap; /* Notify capabilities  */
 uint32_t notify_mult;
-uint16_t q_notify_offset;
 
 static int virtio_pci_set_status(uint8_t status)
 {
@@ -53,6 +52,14 @@ void virtio_pci_id2type(VDev *vdev, uint16_t device_id)
     case 0x1001:
         vdev->dev_type = VIRTIO_ID_BLOCK;
         break;
+    case 0x1048:
+    case 0x1004:
+        vdev->dev_type = VIRTIO_ID_SCSI;
+        break;
+    case 0x1041:
+    case 0x1000:
+        vdev->dev_type = VIRTIO_ID_NET;
+        break;
     default:
         vdev->dev_type = 0;
     }
@@ -74,10 +81,10 @@ int virtio_pci_reset(VDev *vdev)
     return 0;
 }
 
-long virtio_pci_notify(int vq_id)
+long virtio_pci_notify(VRing *vr)
 {
-    uint32_t offset = n_cap.off + notify_mult * q_notify_offset;
-    return vpci_bswap16_write(offset, n_cap.bar, (uint16_t) vq_id);
+    uint32_t offset = n_cap.off + notify_mult * vr->pci_notify;
+    return vpci_bswap16_write(offset, n_cap.bar, (uint16_t) vr->id);
 }
 
 /*
@@ -200,6 +207,37 @@ static int virtio_pci_get_blk_config(void)
     return rc;
 }
 
+static int virtio_pci_get_scsi_config(void)
+{
+    VirtioScsiConfig *cfg = &virtio_get_device()->config.scsi;
+    int rc = vpci_read_flex(d_cap.off, d_cap.bar, cfg, sizeof(VirtioScsiConfig));
+
+    /* all fields of scsi config must be byte swapped */
+    cfg->num_queues = bswap32(cfg->num_queues);
+    cfg->seg_max = bswap32(cfg->seg_max);
+    cfg->max_sectors = bswap32(cfg->max_sectors);
+    cfg->cmd_per_lun = bswap32(cfg->cmd_per_lun);
+    cfg->event_info_size = bswap32(cfg->event_info_size);
+    cfg->sense_size = bswap32(cfg->sense_size);
+    cfg->cdb_size = bswap32(cfg->cdb_size);
+    cfg->max_channel = bswap16(cfg->max_channel);
+    cfg->max_target = bswap16(cfg->max_target);
+    cfg->max_lun = bswap32(cfg->max_lun);
+
+    return rc;
+}
+
+static int virtio_pci_get_net_config(void)
+{
+    VirtioNetConfig *cfg = &virtio_get_device()->config.net;
+
+    /*
+     * Byte-swapping is not needed as only the MAC address (byte array)
+     * is used here. Byte-swap if other fields are added.
+     */
+    return vpci_read_flex(d_cap.off, d_cap.bar, cfg, sizeof(VirtioNetConfig));
+}
+
 static int virtio_pci_negotiate(void)
 {
     int i, rc;
@@ -301,8 +339,7 @@ static int virtio_pci_read_pci_cap_config(void)
     }
 
     rc = vpci_read_bswap32(pos + VPCI_N_CAP_MULT, PCI_CFGBAR, &notify_mult);
-    if (rc || vpci_read_bswap16(c_cap.off + VPCI_C_OFFSET_Q_NOFF, c_cap.bar,
-                                &q_notify_offset)) {
+    if (rc) {
         puts("Failed to read notification queue configuration");
         return -EIO;
     }
@@ -327,16 +364,36 @@ static int enable_pci_bus_master(void)
     return 0;
 }
 
+bool virtio_pci_is_supported(VDev *vdev)
+{
+    if (vdev->vendor_id == PCI_VENDOR_VIRTIO) {
+        switch (vdev->dev_type) {
+        case VIRTIO_ID_BLOCK:
+        case VIRTIO_ID_SCSI:
+        case VIRTIO_ID_NET:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    return false;
+}
+
 int virtio_pci_setup(VDev *vdev)
 {
     VRing *vr;
     int rc;
     uint8_t status;
-    uint16_t vq_size;
     int i = 0;
 
     vdev->guessed_disk_nature = VIRTIO_GDN_NONE;
     vdev->cmd_vr_idx = 0;
+
+    if (!virtio_pci_is_supported(vdev)) {
+        puts("Virtio PCI unsupported for this device ID");
+        return -ENODEV;
+    }
 
     if (virtio_pci_read_pci_cap_config()) {
         puts("Invalid virtio PCI capabilities");
@@ -368,6 +425,15 @@ int virtio_pci_setup(VDev *vdev)
         vdev->cmd_vr_idx = 0;
         virtio_pci_get_blk_config();
         break;
+    case VIRTIO_ID_SCSI:
+        vdev->nr_vqs = 3;
+        vdev->cmd_vr_idx = 2;
+        virtio_pci_get_scsi_config();
+        break;
+    case VIRTIO_ID_NET:
+        vdev->nr_vqs = 2;
+        virtio_pci_get_net_config();
+        break;
     default:
         puts("Unsupported virtio device");
         return -ENODEV;
@@ -380,27 +446,38 @@ int virtio_pci_setup(VDev *vdev)
         return -EIO;
     }
 
-    if (vpci_read_bswap16(VPCI_C_OFFSET_Q_SIZE, c_cap.bar, &vq_size)) {
-        puts("Failed to read virt-queue configuration");
-        return -EIO;
-    }
-
     /* Configure virt-queues for pci */
     for (i = 0; i < vdev->nr_vqs; i++) {
+        uint16_t vq_size;
+        uint16_t vq_notify;
         VqInfo info = {
             .queue = (unsigned long long) virtio_get_ring_area(i),
             .align = KVM_S390_VIRTIO_RING_ALIGN,
             .index = i,
-            .num = vq_size,
+            .num = 0,
         };
 
         vr = &vdev->vrings[i];
-        vring_init(vr, &info);
 
-        if (vpci_set_selected_vq(vr->id)) {
+        if (vpci_set_selected_vq(i)) {
             puts("Failed to set selected virt-queue");
             return -EIO;
         }
+
+        if (vpci_read_bswap16(c_cap.off + VPCI_C_OFFSET_Q_SIZE, c_cap.bar, &vq_size)) {
+            printf("Failed to read virt-queue %d size\n", i);
+            return -EIO;
+        }
+
+        info.num = vq_size;
+
+        if (vpci_read_bswap16(c_cap.off + VPCI_C_OFFSET_Q_NOFF, c_cap.bar, &vq_notify)) {
+            printf("Failed to read virt-queue %d notify offset\n", i);
+            return -EIO;
+        }
+
+        vr->pci_notify = vq_notify;
+        vring_init(vr, &info);
 
         rc = set_pci_vq_addr(VPCI_C_OFFSET_Q_DESCLO, vr->desc);
         rc |= set_pci_vq_addr(VPCI_C_OFFSET_Q_AVAILLO, vr->avail);
@@ -425,7 +502,6 @@ int virtio_pci_setup_device(void)
     VDev *vdev = virtio_get_device();
 
     if (enable_pci_function(&vdev->pci_fh)) {
-        puts("Failed to enable PCI function");
         return -ENODEV;
     }
 

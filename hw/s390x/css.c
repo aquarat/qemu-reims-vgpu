@@ -654,8 +654,13 @@ void css_adapter_interrupt(CssIoAdapterType type, uint8_t isc)
     S390FLICState *fs = s390_get_flic();
     S390FLICStateClass *fsc = s390_get_flic_class(fs);
     uint32_t io_int_word = (isc << 27) | IO_INT_WORD_AI;
-    IoAdapter *adapter = channel_subsys.io_adapters[type][isc];
+    IoAdapter *adapter;
 
+    if (type >= CSS_IO_ADAPTER_TYPE_NUMS || isc > MAX_ISC) {
+        return;
+    }
+
+    adapter = channel_subsys.io_adapters[type][isc];
     if (!adapter) {
         return;
     }
@@ -1011,13 +1016,6 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
 
     check_len = !((ccw.flags & CCW_FLAG_SLI) && !(ccw.flags & CCW_FLAG_DC));
 
-    if (!ccw.cda) {
-        if (sch->ccw_no_data_cnt == 255) {
-            return -EINVAL;
-        }
-        sch->ccw_no_data_cnt++;
-    }
-
     /* Look at the command. */
     ccw_dstream_init(&sch->cds, &ccw, &(sch->orb));
     switch (ccw.cmd_code) {
@@ -1078,6 +1076,12 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
             ret = -EINVAL;
             break;
         }
+        /* Limit the number of TICs in a given channel program */
+        if (sch->ccw_tic_cnt == 255) {
+            ret = -EINVAL;
+            break;
+        }
+        sch->ccw_tic_cnt++;
         sch->channel_prog = ccw.cda;
         ret = -EAGAIN;
         break;
@@ -1092,6 +1096,20 @@ static int css_interpret_ccw(SubchDev *sch, hwaddr ccw_addr,
     }
     sch->last_cmd = ccw;
     sch->last_cmd_valid = true;
+
+    /*
+     * A CCW that transfers no data is allowed, but ensure an upper limit
+     * is established to prevent long-running channel programs that don't
+     * move actual data.
+     */
+    if (ret == 0 && sch->cds.at_byte == 0) {
+        if (sch->ccw_no_data_cnt == 255) {
+            ret = -EINVAL;
+        } else {
+            sch->ccw_no_data_cnt++;
+        }
+    }
+
     if (ret == 0) {
         if (ccw.flags & CCW_FLAG_CC) {
             sch->channel_prog += 8;
@@ -1129,6 +1147,7 @@ static void sch_handle_start_func_virtual(SubchDev *sch)
         sch->ccw_fmt_1 = !!(orb->ctrl0 & ORB_CTRL0_MASK_FMT);
         schib->scsw.flags |= (sch->ccw_fmt_1) ? SCSW_FLAGS_MASK_FMT : 0;
         sch->ccw_no_data_cnt = 0;
+        sch->ccw_tic_cnt = 0;
         suspend_allowed = !!(orb->ctrl0 & ORB_CTRL0_MASK_SPND);
     } else {
         /* Start Function resumed via rsch */
@@ -1872,6 +1891,7 @@ int css_collect_chp_desc(int m, uint8_t cssid, uint8_t f_chpid, uint8_t l_chpid,
     int i, desc_size;
     uint32_t words[8];
     uint32_t chpid_type_word;
+    uint32_t max_chpids, chpid_count = 0;
     CssImage *css;
 
     if (!m && !cssid) {
@@ -1882,9 +1902,25 @@ int css_collect_chp_desc(int m, uint8_t cssid, uint8_t f_chpid, uint8_t l_chpid,
     if (!css) {
         return 0;
     }
+
+    if (rfmt == 0) {
+        max_chpids = 256;
+    } else if (rfmt == 1) {
+        max_chpids = 127;
+    } else {
+        /* Should be rejected by caller */
+        return 0;
+    }
+
     desc_size = 0;
     for (i = f_chpid; i <= l_chpid; i++) {
         if (css->chpids[i].in_use) {
+            /* Limit number of CHPIDs sent back */
+            if (chpid_count == max_chpids) {
+                break;
+            }
+
+            chpid_count++;
             chpid_type_word = 0x80000000 | (css->chpids[i].type << 8) | i;
             if (rfmt == 0) {
                 words[0] = cpu_to_be32(chpid_type_word);
@@ -1999,8 +2035,7 @@ bool css_schid_final(int m, uint8_t cssid, uint8_t ssid, uint16_t schid)
         return true;
     }
     set = channel_subsys.css[real_cssid]->sch_set[ssid];
-    return schid > find_last_bit(set->schids_used,
-                                 (MAX_SCHID + 1) / sizeof(unsigned long));
+    return schid > find_last_bit(set->schids_used, (MAX_SCHID + 1));
 }
 
 unsigned int css_find_free_chpid(uint8_t cssid)

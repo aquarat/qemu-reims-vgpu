@@ -86,9 +86,9 @@ static bool kvm_cpus_are_resettable(void)
 }
 
 #ifdef TARGET_KVM_HAVE_GUEST_DEBUG
-static int kvm_update_guest_debug_ops(CPUState *cpu)
+static void kvm_update_guest_debug_ops(CPUState *cpu)
 {
-    return kvm_update_guest_debug(cpu, 0);
+    kvm_update_guest_debug(cpu, 0);
 }
 #endif
 
@@ -107,10 +107,9 @@ static void kvm_accel_ops_class_init(ObjectClass *oc, const void *data)
 
 #ifdef TARGET_KVM_HAVE_GUEST_DEBUG
     ops->update_guest_debug = kvm_update_guest_debug_ops;
-    ops->supports_guest_debug = kvm_supports_guest_debug;
-    ops->insert_breakpoint = kvm_insert_breakpoint;
-    ops->remove_breakpoint = kvm_remove_breakpoint;
-    ops->remove_all_breakpoints = kvm_remove_all_breakpoints;
+    ops->insert_gdbstub_breakpoint = kvm_insert_gdbstub_breakpoint;
+    ops->remove_gdbstub_breakpoint = kvm_remove_gdbstub_breakpoint;
+    ops->remove_all_gdbstub_breakpoints = kvm_remove_all_gdbstub_breakpoints;
 #endif
 }
 
