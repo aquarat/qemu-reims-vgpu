@@ -599,7 +599,10 @@ static void mach_vmapple_init(MachineState *machine)
     create_bdif(vms, sysmem);
     create_pvpanic(vms, sysmem);
     create_aes(vms, sysmem);
-    create_gfx(vms, sysmem);
+    /* gfx-device=none: no paravirtual GPU (headless guests that need no Metal). */
+    if (strcmp(vms->gfx_device, "none") != 0) {
+        create_gfx(vms, sysmem);
+    }
     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
     create_rtc(vms);
     if (vms->avp_rtc) {
@@ -718,9 +721,10 @@ static void vmapple_set_gfx_device(Object *obj, const char *value,
     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
 
     if (strcmp(value, "apple-gfx-mmio") != 0 &&
-        strcmp(value, "reims-vgpu-mmio") != 0) {
+        strcmp(value, "reims-vgpu-mmio") != 0 &&
+        strcmp(value, "none") != 0) {
         error_setg(errp,
-                   "invalid gfx-device '%s' (valid: apple-gfx-mmio, reims-vgpu-mmio)",
+                   "invalid gfx-device '%s' (valid: apple-gfx-mmio, reims-vgpu-mmio, none)",
                    value);
         return;
     }
