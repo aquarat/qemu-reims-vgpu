@@ -1729,6 +1729,17 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
                 ret = kvm_arm_set_vmapple_g_key(cs, args[0]);
             }
 
+            if (!ret) {
+                /*
+                 * arm64 KVM ignores run->hypercall.ret: SMCCC results go
+                 * back in the guest's x0. macOS 26 checks it after
+                 * SET_INITIAL_STATE ("cbnz x0, ."); Ventura did not.
+                 */
+                uint64_t success = 0;
+
+                ret = kvm_set_one_reg(cs, AARCH64_CORE_REG(regs.regs[0]),
+                                      &success);
+            }
             if (ret) {
                 error_report("failed to service VMApple PAC HVC %#x: %s",
                              function, strerror(-ret));
