@@ -19,10 +19,11 @@ The KVM host commits on top of steelbrain's branch:
 - `hw/vmapple`: follow upstream's removal of `machines-qom.h`.
 - `hw/vmapple`: the `avp,rtc` real-time clock (machine property `avp-rtc`).
 
-It needs a host kernel with the KVM patches from aquarat/asahi-fleet-kernel
-(`kernel/patches/`). The Reims device (aquarat/reims-vgpu) vendors this
+It needs a host kernel with two KVM patches: Apple's PAuth VM-key state and
+in-KVM emulation of MMIO loads/stores without a syndrome (`patches/` in the
+experiment repository below). The Reims device (aquarat/reims-vgpu) vendors this
 repository as `vendor/qemu` and builds QEMU from there. Usage, tests and the
-investigation journal are in aquarat/experiment-macOS-arm64-on-asahi-linux-arm64.
+technical notes are in aquarat/experiment-macos-arm64-on-asahi-linux-arm64.
 
 ## Taking upstream changes
 
