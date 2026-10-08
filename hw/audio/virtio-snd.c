@@ -183,6 +183,57 @@ static virtio_snd_pcm_set_params *virtio_snd_pcm_get_params(VirtIOSound *s,
 }
 
 /*
+ * Handle VIRTIO_SND_R_JACK_INFO and VIRTIO_SND_R_CHMAP_INFO.
+ *
+ * Jack and channel map descriptions are not implemented, but a query that
+ * asks for no items has an empty answer: reply OK. macOS' AppleVirtIOSound
+ * always sends both queries (count = the jacks/chmaps config value, 0 by
+ * default) and refuses to start on anything but OK.
+ *
+ * @s: VirtIOSound device
+ * @cmd: The request command queue element from VirtIOSound cmdq field
+ * @total: number of items of this kind in the device configuration
+ * @what: item name for log messages
+ */
+static void virtio_snd_handle_empty_info(VirtIOSound *s,
+                                         virtio_snd_ctrl_command *cmd,
+                                         uint32_t total, const char *what)
+{
+    virtio_snd_query_info req;
+    uint32_t start_id, count;
+    size_t msg_sz = iov_to_buf(cmd->elem->out_sg,
+                               cmd->elem->out_num,
+                               0,
+                               &req,
+                               sizeof(virtio_snd_query_info));
+
+    if (msg_sz != sizeof(virtio_snd_query_info)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                "%s: virtio-snd command size incorrect %zu vs %zu\n",
+                __func__, msg_sz, sizeof(virtio_snd_query_info));
+        cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_BAD_MSG);
+        return;
+    }
+    start_id = le32_to_cpu(req.start_id);
+    count = le32_to_cpu(req.count);
+    if (start_id > total || count > total - start_id) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                "%s: %s info start_id %u + count %u exceeds %u\n",
+                __func__, what, start_id, count, total);
+        cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_BAD_MSG);
+        return;
+    }
+    if (count) {
+        qemu_log_mask(LOG_UNIMP,
+                      "virtio_snd: %s info functionality is unimplemented.\n",
+                      what);
+        cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_NOT_SUPP);
+        return;
+    }
+    cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_OK);
+}
+
+/*
  * Handle the VIRTIO_SND_R_PCM_INFO request.
  * The function writes the info structs to the request element.
  *
@@ -793,6 +844,8 @@ process_cmd(VirtIOSound *s, virtio_snd_ctrl_command *cmd)
 
     switch (code) {
     case VIRTIO_SND_R_JACK_INFO:
+        virtio_snd_handle_empty_info(s, cmd, s->snd_conf.jacks, "jack");
+        break;
     case VIRTIO_SND_R_JACK_REMAP:
         qemu_log_mask(LOG_UNIMP,
                      "virtio_snd: jack functionality is unimplemented.\n");
@@ -817,10 +870,8 @@ process_cmd(VirtIOSound *s, virtio_snd_ctrl_command *cmd)
         virtio_snd_handle_pcm_release(s, cmd);
         break;
     case VIRTIO_SND_R_CHMAP_INFO:
-        qemu_log_mask(LOG_UNIMP,
-                     "virtio_snd: chmap info functionality is unimplemented.\n");
         trace_virtio_snd_handle_chmap_info();
-        cmd->resp.code = cpu_to_le32(VIRTIO_SND_S_NOT_SUPP);
+        virtio_snd_handle_empty_info(s, cmd, s->snd_conf.chmaps, "chmap");
         break;
     default:
         /* error */
