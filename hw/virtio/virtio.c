@@ -2406,12 +2406,47 @@ hwaddr virtio_queue_get_addr(VirtIODevice *vdev, int n)
     return vdev->vq[n].vring.desc;
 }
 
+/*
+ * A split ring's used ring must not overlap its available ring.  macOS'
+ * AppleVirtIO driver (macOS 26) lays a ring out in one physically
+ * contiguous buffer with no alignment of its own: descriptors, then the
+ * available ring, and reads the used ring at the legacy offset
+ * ALIGN_UP(end of the available ring, 4096).  When the available ring
+ * straddles a 4 KiB boundary, the used ring address it programs into the
+ * device is that boundary, inside the available ring, so the device writes
+ * used entries where the driver never looks and the first request on the
+ * queue never completes.  With x-fix-overlapping-used, move such a used ring
+ * to where the driver reads it.
+ */
+static hwaddr virtio_queue_fixup_used(VirtIODevice *vdev, int n, hwaddr avail,
+                                      hwaddr used)
+{
+    unsigned int num = vdev->vq[n].vring.num;
+    hwaddr avail_end = avail + offsetof(VRingAvail, ring[num]) +
+                       sizeof(uint16_t); /* used_event */
+    hwaddr fixed;
+
+    if (!vdev->fix_overlapping_used ||
+        virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED) ||
+        used < avail || used >= avail_end) {
+        return used;
+    }
+    fixed = QEMU_ALIGN_UP(avail_end, VIRTIO_PCI_VRING_ALIGN);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "%s: queue %d: used ring 0x%" HWADDR_PRIx " overlaps the "
+                  "available ring at 0x%" HWADDR_PRIx ", using 0x%" HWADDR_PRIx
+                  "\n", vdev->name, n, used, avail, fixed);
+    trace_virtio_queue_fixup_used(vdev, n, used, fixed);
+    return fixed;
+}
+
 void virtio_queue_set_rings(VirtIODevice *vdev, int n, hwaddr desc,
                             hwaddr avail, hwaddr used)
 {
     if (!vdev->vq[n].vring.num) {
         return;
     }
+    used = virtio_queue_fixup_used(vdev, n, avail, used);
     vdev->vq[n].vring.desc = desc;
     vdev->vq[n].vring.avail = avail;
     vdev->vq[n].vring.used = used;
@@ -4352,6 +4387,8 @@ static const Property virtio_properties[] = {
     DEFINE_PROP_BOOL("use-disabled-flag", VirtIODevice, use_disabled_flag, true),
     DEFINE_PROP_BOOL("x-disable-legacy-check", VirtIODevice,
                      disable_legacy_check, false),
+    DEFINE_PROP_BOOL("x-fix-overlapping-used", VirtIODevice,
+                     fix_overlapping_used, false),
 };
 
 static int virtio_device_start_ioeventfd_impl(VirtIODevice *vdev)

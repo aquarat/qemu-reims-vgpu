@@ -190,6 +190,7 @@ struct VirtIODevice
     bool started;
     bool start_on_kick; /* when virtio 1.0 feature has not been negotiated */
     bool disable_legacy_check;
+    bool fix_overlapping_used; /* see virtio_queue_fixup_used() */
     bool vhost_started;
     VMChangeStateEntry *vmstate;
     char *bus_name;

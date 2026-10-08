@@ -737,6 +737,11 @@ static GlobalProperty vmapple_compat_defaults[] = {
      * mapping in the XHCI controller works around the problem.
      */
     { TYPE_XHCI_PCI, "conditional-intr-mapping", "on" },
+    /*
+     * macOS' virtio driver can program a used ring address that overlaps
+     * the available ring; see virtio_queue_fixup_used().
+     */
+    { TYPE_VIRTIO_DEVICE, "x-fix-overlapping-used", "on" },
 };
 
 static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
