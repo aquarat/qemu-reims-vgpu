@@ -25,6 +25,9 @@ The KVM host commits on top of steelbrain's branch:
 - `virtio-snd`: answer empty JACK_INFO/CHMAP_INFO queries (AppleVirtIOSound).
 - `hw/vmapple`: at most `max-instances` (default 2, the macOS licence limit)
   vmapple guests per Linux host; a further QEMU refuses to start.
+- `virtio`: relocate a used ring that macOS 26's AppleVirtIO driver places
+  inside the available ring (`x-fix-overlapping-used`, on for vmapple); fixes
+  ~8 % of boots never reaching the network and ~4 % with no sound device.
 
 It needs a host kernel with two KVM patches: Apple's PAuth VM-key state and
 in-KVM emulation of MMIO loads/stores without a syndrome (`patches/` in the
