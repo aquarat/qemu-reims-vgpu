@@ -21,6 +21,7 @@
 #include "qemu/mmap-alloc.h"
 #include "qemu/host-utils.h"
 #include "qemu/cutils.h"
+#include "qemu/units.h"
 #include "qemu/error-report.h"
 
 #define HUGETLBFS_MAGIC       0x958458f6
@@ -79,6 +80,31 @@ size_t qemu_fd_getpagesize(int fd)
 #endif
 
     return qemu_real_host_page_size();
+}
+
+#define HPAGE_PMD_SIZE_PATH "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size"
+size_t qemu_ram_thp_align(void)
+{
+    static size_t align;
+
+    if (!align) {
+        size_t pmd = 0;
+#if defined(__linux__)
+        gchar *content = NULL;
+        const char *endptr;
+        uint64_t tmp;
+
+        if (g_file_get_contents(HPAGE_PMD_SIZE_PATH, &content, NULL, NULL) &&
+            !qemu_strtou64(content, &endptr, 0, &tmp) &&
+            (!endptr || *endptr == '\n') && is_power_of_2(tmp) &&
+            tmp <= 1 * GiB) {
+            pmd = tmp;
+        }
+        g_free(content);
+#endif
+        align = MAX(pmd, QEMU_VMALLOC_ALIGN);
+    }
+    return align;
 }
 
 #define OVERCOMMIT_MEMORY_PATH "/proc/sys/vm/overcommit_memory"

@@ -11,6 +11,15 @@ typedef enum {
 size_t qemu_fd_getpagesize(int fd);
 QemuFsType qemu_fd_getfs(int fd);
 
+/*
+ * qemu_ram_thp_align: alignment for guest RAM mappings backed by ordinary
+ * pages (anonymous memory, tmpfs/memfd), so that transparent huge pages and
+ * KVM stage-2 block mappings can cover them. That is the host's THP PMD size
+ * (2 MiB with 4 KiB pages, 32 MiB with 16 KiB pages, 512 MiB with 64 KiB
+ * pages), never less than QEMU_VMALLOC_ALIGN.
+ */
+size_t qemu_ram_thp_align(void);
+
 /**
  * qemu_ram_mmap: mmap anonymous memory, the specified file or device.
  *

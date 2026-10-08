@@ -210,8 +210,8 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
 {
     const uint32_t qemu_map_flags = (shared ? QEMU_MAP_SHARED : 0) |
                                     (noreserve ? QEMU_MAP_NORESERVE : 0);
-    size_t align = QEMU_VMALLOC_ALIGN;
 #ifndef EMSCRIPTEN
+    size_t align = qemu_ram_thp_align();
     void *ptr = qemu_ram_mmap(-1, size, align, qemu_map_flags, 0);
 
     if (ptr == MAP_FAILED) {
@@ -224,6 +224,7 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
      * space on Emscripten, and shared is ignored as there is no other
      * processes on Emscripten.
      */
+    size_t align = QEMU_VMALLOC_ALIGN;
     void *ptr = qemu_memalign(align, size);
 #endif
 
