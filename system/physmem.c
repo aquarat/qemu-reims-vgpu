@@ -1730,6 +1730,14 @@ static void *file_ram_alloc(RAMBlock *block,
         return NULL;
     }
     block->mr->align = MAX(block->page_size, block->mr->align);
+    if (block->page_size == qemu_real_host_page_size()) {
+        /*
+         * Not hugetlbfs (e.g. memfd or tmpfs): align like anonymous RAM so
+         * shmem THP and KVM block mappings can be used. Unaligned, a memfd
+         * mapping is never THP-eligible.
+         */
+        block->mr->align = MAX(block->mr->align, qemu_ram_thp_align());
+    }
 #if defined(__s390x__)
     if (kvm_enabled()) {
         block->mr->align = MAX(block->mr->align, QEMU_VMALLOC_ALIGN);
