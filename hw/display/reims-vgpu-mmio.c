@@ -35,6 +35,7 @@
 #include "system/address-spaces.h"
 #include "system/hw_accel.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
 #include "system/runstate.h"
 #include "ui/console.h"
 #include "ui/surface.h"
@@ -193,11 +194,10 @@ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
  * bought nothing and every fragmented map leaked a VA reservation until
  * teardown. `map_pages_stable` is 0 accordingly.
  *
- * Linux cannot manufacture a packed view for fragmented pages without
- * file-backed guest RAM, but QEMU's ordinary RAMBlock mapping is already a
- * stable alias.  Accept runs that are contiguous in both guest-physical and
- * host-virtual space (including every valid one-page request) and fail closed
- * only for fragmented runs.
+ * Linux builds the same packed view for fragmented pages from file-backed
+ * guest RAM (memory-backend-memfd,share=on): every page's backing-file offset
+ * is mapped MAP_SHARED|MAP_FIXED into one reserved range. Without a backing
+ * file only runs contiguous in host-virtual space can be served.
  */
 static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
                                   size_t count, void **out_ptr,
@@ -301,9 +301,21 @@ fail:
     g_free(hvas);
     return -1;
 #else
+    /*
+     * Linux: a run contiguous in guest-physical and host-virtual space is
+     * returned as a direct RAMBlock alias. A fragmented run gets a packed view
+     * like Darwin's mach_vm_remap one: guest RAM must be file-backed
+     * (memory-backend-memfd,share=on), so each page's backing-file offset can
+     * be mapped MAP_SHARED|MAP_FIXED into one reserved range. The view shares
+     * the guest's pages (writes through it land in guest RAM) and is released
+     * by unmap_pages.
+     */
+    ReimsVGPUMMIOState *s = ctx;
     const hwaddr page = REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E;
-    uint8_t *base = NULL;
-    MemoryRegion *base_mr = NULL;
+    uint8_t **hvas = NULL;
+    uint8_t *view = MAP_FAILED;
+    size_t view_len;
+    ReimsVGPUMMIOPageView view_entry;
     size_t i;
 
     if (failure) {
@@ -311,14 +323,15 @@ fail:
             .stage = REIMS_VGPU_MAP_PAGES_FAILURE_NONE,
         };
     }
-    if (!ctx || !gpas || count == 0 || !out_ptr ||
-        count > SIZE_MAX / page) {
+    if (!s || !gpas || count == 0 || !out_ptr || count > SIZE_MAX / page) {
         if (failure) {
             failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
             failure->page_index = UINT64_MAX;
         }
         return -1;
     }
+    view_len = count * page;
+    hvas = g_new(uint8_t *, count);
 
     rcu_read_lock();
     for (i = 0; i < count; i++) {
@@ -333,33 +346,88 @@ fail:
             goto invalid_page;
         }
         hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
-        if (i == 0) {
-            base = hva;
-            base_mr = mr;
-            if (((uintptr_t)base & (page - 1)) != 0) {
-                goto invalid_page;
-            }
-        } else if (mr != base_mr || hva != base + i * page) {
-            /* Fragmented run: no packed view without file-backed guest RAM. */
-            if (failure) {
-                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
-                failure->page_index = i;
-            }
-            goto linux_fail;
+        if (((uintptr_t)hva & (page - 1)) != 0) {
+            goto invalid_page;
         }
+        hvas[i] = hva;
+    }
+
+    for (i = 1; i < count; i++) {
+        if (hvas[i] != hvas[0] + i * page) {
+            break;
+        }
+    }
+    if (i == count) {
+        rcu_read_unlock();
+        *out_ptr = hvas[0];
+        g_free(hvas);
+        return 0;
+    }
+
+    view = mmap(NULL, view_len, PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (view == MAP_FAILED) {
+        rcu_read_unlock();
+        if (failure) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION;
+        }
+        g_free(hvas);
+        return -1;
+    }
+    for (i = 0; i < count;) {
+        ram_addr_t block_off;
+        RAMBlock *rb = qemu_ram_block_from_host(hvas[i], false, &block_off);
+        int fd = rb ? qemu_ram_get_fd(rb) : -1;
+        off_t foff;
+        size_t run = 1;
+
+        if (fd < 0) {
+            static bool warned;
+            if (!warned) {
+                warned = true;
+                qemu_log_mask(LOG_UNIMP, "%s: fragmented guest pages need "
+                              "file-backed guest RAM (memory-backend-memfd,"
+                              "share=on)\n", TYPE_REIMS_VGPU_MMIO);
+            }
+            goto alias_fail;
+        }
+        foff = (off_t)(qemu_ram_get_fd_offset(rb) + block_off);
+        /* Coalesce pages that are also consecutive in the backing file. */
+        while (i + run < count && hvas[i + run] == hvas[i] + run * page) {
+            run++;
+        }
+        if (mmap(view + i * page, run * page, PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_FIXED, fd, foff) == MAP_FAILED) {
+            goto alias_fail;
+        }
+        i += run;
     }
     rcu_read_unlock();
 
-    *out_ptr = base;
+    *out_ptr = view;
+    view_entry.ptr = view;
+    view_entry.len = view_len;
+    g_array_append_val(s->page_views, view_entry);
+    g_free(hvas);
     return 0;
 
+alias_fail:
+    rcu_read_unlock();
+    munmap(view, view_len);
+    if (failure) {
+        failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+        failure->page_index = i;
+    }
+    g_free(hvas);
+    return -1;
+
 invalid_page:
+    rcu_read_unlock();
     if (failure) {
         failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
         failure->page_index = i;
     }
-linux_fail:
-    rcu_read_unlock();
+    g_free(hvas);
     return -1;
 #endif
 }
@@ -394,9 +462,22 @@ static void reims_vgpu_mmio_unmap_pages(void *ctx, void *ptr, size_t len)
         }
     }
 #else
-    (void)ctx;
-    (void)ptr;
+    ReimsVGPUMMIOState *s = ctx;
+    size_t i;
+
     (void)len;
+    if (!s || !ptr || !s->page_views) {
+        return;
+    }
+    for (i = 0; i < s->page_views->len; i++) {
+        ReimsVGPUMMIOPageView *view =
+            &g_array_index(s->page_views, ReimsVGPUMMIOPageView, i);
+        if (view->ptr == ptr) {
+            munmap(ptr, view->len);
+            g_array_remove_index_fast(s->page_views, i);
+            return;
+        }
+    }
 #endif
 }
 
@@ -428,7 +509,22 @@ static void reims_vgpu_mmio_free_page_views(ReimsVGPUMMIOState *s)
     }
     g_array_set_size(s->page_views, 0);
 #else
-    (void)s;
+    size_t i;
+
+    if (!s->page_views) {
+        return;
+    }
+    if (s->page_views->len != 0) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: %u guest page view(s) still mapped at teardown\n",
+                      TYPE_REIMS_VGPU_MMIO, s->page_views->len);
+    }
+    for (i = 0; i < s->page_views->len; i++) {
+        ReimsVGPUMMIOPageView *view =
+            &g_array_index(s->page_views, ReimsVGPUMMIOPageView, i);
+        munmap(view->ptr, view->len);
+    }
+    g_array_set_size(s->page_views, 0);
 #endif
 }
 
@@ -1041,19 +1137,15 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         /*
-         * Darwin can return transient packed mach_vm_remap views. Linux only
-         * accepts direct RAMBlock aliases, which remain valid for the VM
-         * lifetime and require no unmap.
+         * Fragmented runs come back as transient packed views on both hosts
+         * (mach_vm_remap on Darwin, MAP_SHARED|MAP_FIXED over the memfd on
+         * Linux), so callers must release what they map.
          *
          * The GPU rail does not read this and must not: it imports the spans
          * guest_ram_regions names, which are RAMBlock mappings this shim never
          * built and never releases.
          */
-#if defined(CONFIG_DARWIN)
         .map_pages_stable = 0,
-#else
-        .map_pages_stable = 1,
-#endif
         .track_guest_writes = reims_vgpu_mmio_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_mmio_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_mmio_guest_write_gen,
