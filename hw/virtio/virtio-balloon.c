@@ -400,11 +400,235 @@ skip_element:
     }
 }
 
+/*
+ * macOS guests: AppleVirtIOBalloon (macOS 26), with macos-units=on.
+ *
+ * The driver keeps its own count P of surrendered memory in 4 KiB units and
+ * never uses `actual`. On a config interrupt and after every completed
+ * inflate or deflate buffer it runs
+ *
+ *     N = config.num_pages;
+ *     if (N > P) inflate(P, N);   allocates N - P 16 KiB pages, P += 4 (N - P)
+ *     if (N < P) deflate(P, N);   N as read above, P possibly just raised
+ *
+ * deflate(P, N) gives back P - N 16 KiB pages taken from the inflate buffers
+ * already completed by the device (R), P -= 4 (P - N), and does nothing if
+ * R is too small. P is raised when a buffer is posted, before the device has
+ * consumed it. So:
+ *  - every request moves 4x the difference: present a quarter of it;
+ *  - every inflate of d pages is followed, in the same call, by a deflate of
+ *    3d pages, which succeeds as soon as R >= 3d: past three steps a balloon
+ *    shrinks again and a fixed target oscillates. With macos-hold=on the
+ *    device keeps inflate buffers instead of completing them (their memory
+ *    is discarded at once), so R stays 0 and that deflate always fails. To
+ *    deflate, it completes just enough held buffers and then presents a
+ *    num_pages that gives back exactly those (R);
+ *  - a config read between posting and consumption would see a stale
+ *    `actual`: config reads consume posted buffers first;
+ *  - each request must fit the queue (MACOS_DEFLATE_MAX below).
+ */
+static ram_addr_t get_current_ram_size(void);
+
+/*
+ * deflate() and inflate() limit a request to (free descriptors) x 4096 of
+ * their units, but a 16 KiB PFN-array segment holds only 1024 of them
+ * (4096 PFNs): a larger request fails to post and is retried forever. Keep
+ * a deflate within 128 segments; the queues are 1024 entries.
+ */
+#define MACOS_DEFLATE_MAX   (128 * 4096)    /* PFNs = 2 GiB */
+
+static uint32_t virtio_balloon_macos_num_pages(VirtIOBalloon *s)
+{
+    int64_t actual = s->actual, target = s->num_pages;
+    int64_t completed = actual - s->macos_held_pfns;
+    int64_t step = MAX(s->macos_step, 4), d;
+
+    if (s->macos_hold && completed >= 4) {
+        /* give back the released buffers, at most 2 GiB per round */
+        return actual - MIN(completed, MACOS_DEFLATE_MAX) / 4;
+    }
+    if (target > actual) {
+        d = MIN(target - actual, step) & ~3;
+        return actual + d / 4;
+    }
+    if (target < actual && !s->macos_hold) {
+        d = MIN(actual - target, step) & ~3;
+        return actual - d / 4;
+    }
+    return actual;
+}
+
+static void virtio_balloon_macos_discard(hwaddr pa, hwaddr len)
+{
+    while (len) {
+        MemoryRegionSection section;
+        hwaddr n = BALLOON_PAGE_SIZE;
+
+        section = memory_region_find(get_system_memory(), pa, len);
+        if (!section.mr) {
+            trace_virtio_balloon_bad_addr(pa);
+        } else {
+            n = int128_get64(section.size) ?: BALLOON_PAGE_SIZE;
+            if (memory_region_is_ram(section.mr) &&
+                !memory_region_is_rom(section.mr) &&
+                !memory_region_is_romd(section.mr)) {
+                void *host = memory_region_get_ram_ptr(section.mr) +
+                             section.offset_within_region;
+                ram_addr_t off, start, end;
+                RAMBlock *rb = qemu_ram_block_from_host(host, false, &off);
+
+                if (rb) {
+                    /* the driver hands over whole 16 KiB pages */
+                    start = QEMU_ALIGN_UP(off, qemu_ram_pagesize(rb));
+                    end = QEMU_ALIGN_DOWN(off + n, qemu_ram_pagesize(rb));
+                    if (end > start) {
+                        ram_block_discard_range(rb, start, end - start);
+                    }
+                }
+            } else {
+                trace_virtio_balloon_bad_addr(pa);
+            }
+            memory_region_unref(section.mr);
+        }
+        n = MIN(n, len);
+        pa += n;
+        len -= n;
+    }
+}
+
+/* Count the PFNs in one buffer; discard runs of contiguous pages on inflate. */
+static uint32_t virtio_balloon_macos_consume(VirtIOBalloon *s,
+                                             VirtQueueElement *elem,
+                                             bool inflate)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    bool discard = inflate && !virtio_balloon_inhibited();
+    hwaddr run = 0, run_len = 0;
+    uint32_t pfns[512], n = 0;
+    size_t offset = 0, got;
+
+    while ((got = iov_to_buf(elem->out_sg, elem->out_num, offset,
+                             pfns, sizeof(pfns))) >= 4) {
+        for (size_t i = 0; i < got / 4; i++) {
+            hwaddr pa = (hwaddr)virtio_ldl_p(vdev, &pfns[i]) <<
+                        VIRTIO_BALLOON_PFN_SHIFT;
+
+            n++;
+            if (!discard) {
+                continue;
+            }
+            if (run_len && pa == run + run_len) {
+                run_len += BALLOON_PAGE_SIZE;
+                continue;
+            }
+            if (run_len) {
+                virtio_balloon_macos_discard(run, run_len);
+            }
+            run = pa;
+            run_len = BALLOON_PAGE_SIZE;
+        }
+        offset += got & ~3;
+    }
+    if (run_len) {
+        virtio_balloon_macos_discard(run, run_len);
+    }
+    return n;
+}
+
+/*
+ * After a target change or a consumed buffer: complete held buffers if a
+ * deflate needs them, else (notify_cfg) ask the driver for the next step.
+ */
+static void virtio_balloon_macos_update(VirtIOBalloon *s, bool notify_cfg)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    int64_t actual = s->actual, target = s->num_pages;
+    int64_t completed = actual - s->macos_held_pfns;
+    bool released = false;
+
+    if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+        return;
+    }
+    while (s->macos_hold && target < actual && completed < actual - target &&
+           !QTAILQ_EMPTY(&s->macos_held)) {
+        VirtIOBalloonHeldElem *h = QTAILQ_LAST(&s->macos_held);
+
+        QTAILQ_REMOVE(&s->macos_held, h, next);
+        s->macos_held_pfns -= h->pfns;
+        completed += h->pfns;
+        trace_virtio_balloon_macos_release(h->pfns, s->macos_held_pfns);
+        virtqueue_push(s->ivq, &h->elem, 0);
+        g_free(h);
+        released = true;
+    }
+    if (released) {
+        /* the driver's completion handler takes it from here */
+        virtio_notify(vdev, s->ivq);
+    } else if (notify_cfg && virtio_balloon_macos_num_pages(s) != actual) {
+        virtio_notify_config(vdev);
+    }
+}
+
+static void virtio_balloon_macos_handle(VirtIOBalloon *s, VirtQueue *vq,
+                                        bool notify_cfg)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    bool inflate = vq == s->ivq, any = false;
+    VirtIOBalloonHeldElem *h;
+
+    while ((h = virtqueue_pop(vq, sizeof(VirtIOBalloonHeldElem)))) {
+        uint32_t n = virtio_balloon_macos_consume(s, &h->elem, inflate);
+
+        any = true;
+        if (inflate) {
+            s->actual += n;
+        } else {
+            s->actual -= MIN(n, s->actual);
+        }
+        if (inflate && s->macos_hold) {
+            h->pfns = n;
+            QTAILQ_INSERT_TAIL(&s->macos_held, h, next);
+            s->macos_held_pfns += n;
+            trace_virtio_balloon_macos_buf(inflate, n, s->actual,
+                                           s->macos_held_pfns);
+            continue;
+        }
+        trace_virtio_balloon_macos_buf(inflate, n, s->actual,
+                                       s->macos_held_pfns);
+        virtqueue_push(vq, &h->elem, 0);
+        virtio_notify(vdev, vq);
+        g_free(h);
+    }
+    if (any) {
+        qapi_event_send_balloon_change(get_current_ram_size() -
+                        ((ram_addr_t)s->actual << VIRTIO_BALLOON_PFN_SHIFT));
+        /* a completed deflate buffer re-runs the driver's handler itself */
+        virtio_balloon_macos_update(s, notify_cfg && inflate);
+    }
+}
+
+static void virtio_balloon_macos_drop_held(VirtIOBalloon *s)
+{
+    VirtIOBalloonHeldElem *h;
+
+    while ((h = QTAILQ_FIRST(&s->macos_held))) {
+        QTAILQ_REMOVE(&s->macos_held, h, next);
+        virtqueue_detach_element(s->ivq, &h->elem, 0);
+        g_free(h);
+    }
+    s->macos_held_pfns = 0;
+}
+
 static void virtio_balloon_handle_output(VirtIODevice *vdev, VirtQueue *vq)
 {
     VirtIOBalloon *s = VIRTIO_BALLOON(vdev);
     VirtQueueElement *elem;
     MemoryRegionSection section;
+
+    if (s->macos_units) {
+        virtio_balloon_macos_handle(s, vq, true);
+        return;
+    }
 
     for (;;) {
         PartiallyBalloonedPage pbp = {};
@@ -726,7 +950,17 @@ static void virtio_balloon_get_config(VirtIODevice *vdev, uint8_t *config_data)
     VirtIOBalloon *dev = VIRTIO_BALLOON(vdev);
     struct virtio_balloon_config config = {};
 
-    config.num_pages = cpu_to_le32(dev->num_pages);
+    if (dev->macos_units) {
+        /* make `actual` match the driver's count before it compares */
+        virtio_balloon_macos_handle(dev, dev->ivq, false);
+        virtio_balloon_macos_handle(dev, dev->dvq, false);
+        config.num_pages = cpu_to_le32(virtio_balloon_macos_num_pages(dev));
+        trace_virtio_balloon_macos_config(dev->num_pages, dev->actual,
+                                          dev->macos_held_pfns,
+                                          le32_to_cpu(config.num_pages));
+    } else {
+        config.num_pages = cpu_to_le32(dev->num_pages);
+    }
     config.actual = cpu_to_le32(dev->actual);
     config.poison_val = cpu_to_le32(dev->poison_val);
 
@@ -772,7 +1006,9 @@ static void virtio_balloon_set_config(VirtIODevice *vdev,
     ram_addr_t vm_ram_size = get_current_ram_size();
 
     memcpy(&config, config_data, virtio_balloon_config_size(dev));
-    dev->actual = le32_to_cpu(config.actual);
+    if (!dev->macos_units) {    /* the device counts PFNs instead */
+        dev->actual = le32_to_cpu(config.actual);
+    }
     if (dev->actual != oldactual) {
         qapi_event_send_balloon_change(vm_ram_size -
                         ((ram_addr_t) dev->actual << VIRTIO_BALLOON_PFN_SHIFT));
@@ -812,7 +1048,11 @@ static void virtio_balloon_to_target(void *opaque, ram_addr_t target)
     }
     if (target) {
         dev->num_pages = (vm_ram_size - target) >> VIRTIO_BALLOON_PFN_SHIFT;
-        virtio_notify_config(vdev);
+        if (dev->macos_units) {
+            virtio_balloon_macos_update(dev, true);
+        } else {
+            virtio_notify_config(vdev);
+        }
     }
     trace_virtio_balloon_to_target(target, dev->num_pages);
 }
@@ -891,8 +1131,12 @@ static void virtio_balloon_device_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    s->ivq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
-    s->dvq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
+    /* macOS: held buffers occupy the inflate queue; requests need segments */
+    QTAILQ_INIT(&s->macos_held);
+    s->ivq = virtio_add_queue(vdev, s->macos_units ? VIRTQUEUE_MAX_SIZE : 128,
+                              virtio_balloon_handle_output);
+    s->dvq = virtio_add_queue(vdev, s->macos_units ? VIRTQUEUE_MAX_SIZE : 128,
+                              virtio_balloon_handle_output);
     s->svq = virtio_add_queue(vdev, 128, virtio_balloon_receive_stats);
 
     if (virtio_has_feature(s->host_features, VIRTIO_BALLOON_F_FREE_PAGE_HINT)) {
@@ -943,6 +1187,7 @@ static void virtio_balloon_device_unrealize(DeviceState *dev)
     }
     balloon_stats_destroy_timer(s);
     qemu_remove_balloon_handler(s);
+    virtio_balloon_macos_drop_held(s);
 
     virtio_delete_queue(s->ivq);
     virtio_delete_queue(s->dvq);
@@ -968,6 +1213,12 @@ static void virtio_balloon_device_reset(VirtIODevice *vdev)
         virtqueue_unpop(s->svq, s->stats_vq_elem, 0);
         g_free(s->stats_vq_elem);
         s->stats_vq_elem = NULL;
+    }
+
+    if (s->macos_units) {
+        /* a rebooted driver starts from an empty balloon */
+        virtio_balloon_macos_drop_held(s);
+        s->actual = 0;
     }
 
     s->poison_val = 0;
@@ -1056,6 +1307,9 @@ static const VMStateDescription vmstate_virtio_balloon = {
 };
 
 static const Property virtio_balloon_properties[] = {
+    DEFINE_PROP_BOOL("macos-units", VirtIOBalloon, macos_units, false),
+    DEFINE_PROP_BOOL("macos-hold", VirtIOBalloon, macos_hold, true),
+    DEFINE_PROP_UINT32("macos-step", VirtIOBalloon, macos_step, 65536),
     DEFINE_PROP_BIT("deflate-on-oom", VirtIOBalloon, host_features,
                     VIRTIO_BALLOON_F_DEFLATE_ON_OOM, false),
     DEFINE_PROP_BIT("free-page-hint", VirtIOBalloon, host_features,
