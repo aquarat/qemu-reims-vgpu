@@ -18,6 +18,13 @@ The KVM host commits on top of steelbrain's branch:
 - `hw/display/reims-vgpu-mmio`: poll the device without a host window (headless).
 - `hw/vmapple`: follow upstream's removal of `machines-qom.h`.
 - `hw/vmapple`: the `avp,rtc` real-time clock (machine property `avp-rtc`).
+- `hw/vmapple`: `gfx-device=none` for guests without a paravirtual GPU.
+- `hw/display/reims-vgpu-mmio`: packed page views on Linux (memfd-backed RAM).
+- `util`: guest RAM aligned to the host's THP PMD size (32 MiB on 16K hosts).
+- `virtio-balloon`: `macos-units` for Apple's AppleVirtIOBalloon driver.
+- `virtio-snd`: answer empty JACK_INFO/CHMAP_INFO queries (AppleVirtIOSound).
+- `hw/vmapple`: at most `max-instances` (default 2, the macOS licence limit)
+  vmapple guests per Linux host; a further QEMU refuses to start.
 
 It needs a host kernel with two KVM patches: Apple's PAuth VM-key state and
 in-KVM emulation of MMIO loads/stores without a syndrome (`patches/` in the

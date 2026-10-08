@@ -25,6 +25,7 @@
 #include "qemu/module.h"
 #include "qemu/option.h"
 #include "qemu/units.h"
+#include "qemu/sockets.h"
 #include "monitor/qdev.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
@@ -75,6 +76,8 @@ struct VMAppleMachineState {
     uint64_t uuid;
     char *gfx_device;
     bool avp_rtc;
+    uint32_t max_instances;
+    int instance_fd;
 };
 
 #define TYPE_VMAPPLE_MACHINE   MACHINE_TYPE_NAME("vmapple")
@@ -527,6 +530,55 @@ static void vmapple_reset(void *opaque)
     cpu_set_pc(first_cpu, base);
 }
 
+/*
+ * Apple's macOS licence allows at most two additional virtualised instances
+ * of macOS per Mac. On Linux hosts, claim one of max-instances host-wide
+ * slots before building the machine: slot N is the abstract Unix socket
+ * "@vmapple-macos-instance-N", bound for the life of the process. The kernel
+ * releases it when QEMU exits, however it exits, and a name can be bound only
+ * once per network namespace, whichever user runs QEMU. Taken slots show up
+ * in /proc/net/unix, which scripts can read to wait for a free one.
+ * max-instances=0 disables the check.
+ */
+static void vmapple_claim_instance_slot(VMAppleMachineState *vms)
+{
+#ifdef __linux__
+    uint32_t n;
+
+    vms->instance_fd = -1;
+    if (!vms->max_instances) {
+        return;
+    }
+    for (n = 0; n < vms->max_instances; n++) {
+        struct sockaddr_un sa = { .sun_family = AF_UNIX };
+        int len = snprintf(sa.sun_path + 1, sizeof(sa.sun_path) - 1,
+                           "vmapple-macos-instance-%u", n);
+        int fd = qemu_socket(AF_UNIX, SOCK_STREAM, 0);
+
+        if (fd < 0) {
+            error_report("vmapple: cannot create the instance-slot socket: %s",
+                         strerror(errno));
+            exit(1);
+        }
+        if (bind(fd, (struct sockaddr *)&sa,
+                 offsetof(struct sockaddr_un, sun_path) + 1 + len) == 0) {
+            vms->instance_fd = fd;
+            return;
+        }
+        close(fd);
+        if (errno != EADDRINUSE) {
+            error_report("vmapple: cannot bind the instance-slot socket: %s",
+                         strerror(errno));
+            exit(1);
+        }
+    }
+    error_report("vmapple: %u macOS guests are already running on this host "
+                 "(machine property max-instances; Apple's licence allows two "
+                 "per Mac)", vms->max_instances);
+    exit(1);
+#endif
+}
+
 static void mach_vmapple_init(MachineState *machine)
 {
     VMAppleMachineState *vms = VMAPPLE_MACHINE(machine);
@@ -537,6 +589,7 @@ static void mach_vmapple_init(MachineState *machine)
     unsigned int smp_cpus = machine->smp.cpus;
     unsigned int max_cpus = machine->smp.max_cpus;
 
+    vmapple_claim_instance_slot(vms);
     vms->memmap = memmap;
     machine->usb = true;
 
@@ -750,6 +803,8 @@ static void vmapple_instance_init(Object *obj)
     vms->irqmap = irqmap;
     vms->gfx_device = g_strdup("apple-gfx-mmio");
     vms->avp_rtc = true;
+    vms->max_instances = 2;
+    vms->instance_fd = -1;
 
     object_property_add_uint64_ptr(obj, "uuid", &vms->uuid,
                                    OBJ_PROP_FLAG_READWRITE);
@@ -764,6 +819,13 @@ static void vmapple_instance_init(Object *obj)
     object_property_set_description(obj, "avp-rtc",
                                     "Provide the avp,rtc clock macOS expects "
                                     "(default on; off leaves only the PL031)");
+    object_property_add_uint32_ptr(obj, "max-instances", &vms->max_instances,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "max-instances",
+                                    "Refuse to start when this many vmapple "
+                                    "guests already run on the host (Linux; "
+                                    "default 2, the macOS licence limit; 0 "
+                                    "disables the check)");
 }
 
 static void vmapple_instance_finalize(Object *obj)
@@ -771,6 +833,9 @@ static void vmapple_instance_finalize(Object *obj)
     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
 
     g_free(vms->gfx_device);
+    if (vms->instance_fd >= 0) {
+        close(vms->instance_fd);
+    }
 }
 
 static const TypeInfo vmapple_machine_info = {
