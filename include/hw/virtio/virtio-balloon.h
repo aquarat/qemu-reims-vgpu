@@ -42,6 +42,12 @@ enum virtio_balloon_free_page_hint_status {
     FREE_PAGE_HINT_S_UNREALIZE = 4,
 };
 
+typedef struct VirtIOBalloonHeldElem {
+    VirtQueueElement elem;      /* must be first (virtqueue_pop) */
+    uint32_t pfns;
+    QTAILQ_ENTRY(VirtIOBalloonHeldElem) next;
+} VirtIOBalloonHeldElem;
+
 struct VirtIOBalloon {
     VirtIODevice parent_obj;
     VirtQueue *ivq, *dvq, *svq, *free_page_vq, *reporting_vq;
@@ -70,6 +76,17 @@ struct VirtIOBalloon {
     int64_t stats_last_update;
     int64_t stats_poll_interval;
     uint32_t host_features;
+    /*
+     * macOS guests (AppleVirtIOBalloon, see virtio-balloon.c): the device
+     * counts the 4 KiB PFNs it receives into `actual`, presents num_pages in
+     * the driver's units one bounded step at a time, and (macos_hold) keeps
+     * inflate buffers instead of completing them.
+     */
+    bool macos_units;
+    bool macos_hold;
+    uint32_t macos_step;        /* max 4 KiB pages per inflate step */
+    uint32_t macos_held_pfns;   /* PFNs in held inflate buffers */
+    QTAILQ_HEAD(, VirtIOBalloonHeldElem) macos_held;
 
     uint32_t poison_val;
 
