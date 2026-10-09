@@ -732,6 +732,13 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
 
+    /*
+     * The drain reads and writes guest memory through address_space_read/
+     * write, which take the RCU read lock. A thread that has not registered
+     * is invisible to synchronize_rcu, so a flatview could be reclaimed while
+     * this thread is still translating through it.
+     */
+    rcu_register_thread();
     for (;;) {
         int rc;
 
@@ -753,6 +760,7 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
         }
         qemu_bh_schedule(s->action_bh);
     }
+    rcu_unregister_thread();
     return NULL;
 }
 
@@ -770,6 +778,8 @@ static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
 
+    /* device_poll writes the display's shared page: same reason as the drain. */
+    rcu_register_thread();
     qemu_mutex_lock(&s->heartbeat_mutex);
     while (!s->heartbeat_stopping) {
         qemu_cond_timedwait(&s->heartbeat_cond, &s->heartbeat_mutex,
@@ -788,6 +798,7 @@ static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
         qemu_mutex_lock(&s->heartbeat_mutex);
     }
     qemu_mutex_unlock(&s->heartbeat_mutex);
+    rcu_unregister_thread();
     return NULL;
 }
 
