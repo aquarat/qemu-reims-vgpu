@@ -158,3 +158,8 @@ config MAC_PVG_PCI
     bool
     depends on MAC_PVG && PCI
     default y if PCI_DEVICES
+
+# A paravirtual GPU whose device model runs in a separate process
+# (include/hw/display/apv-gpu-proxy-protocol.h).
+config APV_GPU_PROXY
+    bool

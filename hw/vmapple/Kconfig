@@ -35,4 +35,5 @@ config VMAPPLE
     select VMAPPLE_BDIF
     select VMAPPLE_CFG
     imply MAC_PVG_MMIO
+    select APV_GPU_PROXY
     select VMAPPLE_VIRTIO_BLK

@@ -777,10 +777,11 @@ static void vmapple_set_gfx_device(Object *obj, const char *value,
     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
 
     if (strcmp(value, "apple-gfx-mmio") != 0 &&
+        strcmp(value, "apv-gpu-proxy") != 0 &&
         strcmp(value, "none") != 0) {
         error_setg(errp,
-                   "invalid gfx-device '%s' (valid: apple-gfx-mmio, none)",
-                   value);
+                   "invalid gfx-device '%s' (valid: apple-gfx-mmio, "
+                   "apv-gpu-proxy, none)", value);
         return;
     }
 
@@ -814,8 +815,8 @@ static void vmapple_instance_init(Object *obj)
     object_property_add_str(obj, "gfx-device", vmapple_get_gfx_device,
                             vmapple_set_gfx_device);
     object_property_set_description(obj, "gfx-device",
-                                    "Paravirt GPU device backing the Reims VGPU "
-                                    "slots (apple-gfx-mmio | none)");
+                                    "Paravirtual GPU device in the GPU slot "
+                                    "(apple-gfx-mmio | apv-gpu-proxy | none)");
     object_property_add_bool(obj, "avp-rtc", vmapple_get_avp_rtc,
                              vmapple_set_avp_rtc);
     object_property_set_description(obj, "avp-rtc",
