@@ -106,6 +106,21 @@ struct ReimsVGPUMMIOState {
     /* Device poll stays on QEMU's background emulation loop. */
     QEMUTimer *poll_timer;
 
+    /*
+     * The drain runs on its own thread, as on the PCI shim. Run as a
+     * main-loop BH it held the BQL for a whole tranche (tens of ms for a
+     * simulator frame), so every vCPU exit that needed the BQL and every
+     * completion IRQ the tranche produced waited behind it. HostActions are
+     * still applied only on the main loop, by action_bh.
+     */
+    QemuThread drain_thread;
+    QemuMutex drain_mutex;
+    QemuCond drain_cond;
+    bool drain_pending;
+    bool drain_stopping;
+    bool drain_thread_started;
+    QEMUBH *action_bh;
+
     /* Filled at realize; address passed into Rust create. */
     ReimsVgpuHostOps host_ops;
     /* Hypervisor dirty-bitmap adapter: the only witness for a write to a
@@ -574,14 +589,32 @@ static void reims_vgpu_mmio_schedule_bh(void *ctx)
     ReimsVGPUMMIOState *s = ctx;
 
     /*
-     * Same pattern as apple-gfx raiseInterrupt: oneshot BH on the main AIO
-     * context. Safe if called while already on the BQL (MMIO path).
-     *
-     * Archive also pumps aio_poll after schedule so drain runs under the
-     * guest GPU spinlock. Product drains synchronously inside Rust MMIO
-     * (current_cpu for KVA); the BH only delivers residual work + actions.
+     * Wake the drain worker. Callable from any thread (vCPU MMIO stores,
+     * the drain itself, the main loop); before the worker exists the old
+     * main-loop BH still serves the request.
      */
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), reims_vgpu_mmio_bh, s);
+    if (!s->drain_thread_started) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(), reims_vgpu_mmio_bh, s);
+        return;
+    }
+    qemu_mutex_lock(&s->drain_mutex);
+    s->drain_pending = true;
+    qemu_cond_signal(&s->drain_cond);
+    qemu_mutex_unlock(&s->drain_mutex);
+}
+
+/*
+ * Prompt HostAction delivery (IRQ pulses, cursor moves): schedule the action
+ * BH from any thread so a completion reaches the guest while the drain worker
+ * is still executing the rest of its tranche. qemu_bh_schedule is thread-safe.
+ */
+static void reims_vgpu_mmio_notify_actions(void *ctx)
+{
+    ReimsVGPUMMIOState *s = ctx;
+
+    if (s->action_bh) {
+        qemu_bh_schedule(s->action_bh);
+    }
 }
 
 /*
@@ -828,6 +861,51 @@ static void reims_vgpu_mmio_bh(void *opaque)
     }
 
     reims_vgpu_mmio_deliver_actions(s);
+}
+
+static void reims_vgpu_mmio_action_bh(void *opaque)
+{
+    ReimsVGPUMMIOState *s = opaque;
+
+    if (s->rust_handle == 0) {
+        return;
+    }
+    reims_vgpu_mmio_deliver_actions(s);
+}
+
+static void *reims_vgpu_mmio_drain_thread(void *opaque)
+{
+    ReimsVGPUMMIOState *s = opaque;
+
+    /*
+     * The drain reads and writes guest memory through address_space_read/
+     * write, which take the RCU read lock; an unregistered reader is invisible
+     * to synchronize_rcu, so a flatview could be reclaimed under it.
+     */
+    rcu_register_thread();
+    for (;;) {
+        int rc;
+
+        qemu_mutex_lock(&s->drain_mutex);
+        while (!s->drain_pending && !s->drain_stopping) {
+            qemu_cond_wait(&s->drain_cond, &s->drain_mutex);
+        }
+        if (s->drain_stopping) {
+            qemu_mutex_unlock(&s->drain_mutex);
+            break;
+        }
+        s->drain_pending = false;
+        qemu_mutex_unlock(&s->drain_mutex);
+
+        rc = reims_vgpu_qemu_device_drain(s->rust_handle);
+        if (rc != REIMS_VGPU_QEMU_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: worker drain failed rc=%d\n",
+                          TYPE_REIMS_VGPU_MMIO, rc);
+        }
+        qemu_bh_schedule(s->action_bh);
+    }
+    rcu_unregister_thread();
+    return NULL;
 }
 
 static void reims_vgpu_mmio_poll_tick(void *opaque)
@@ -1118,6 +1196,7 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .write_gpa = reims_vgpu_shim_write_gpa,
         .mono_ns = reims_vgpu_shim_mono_ns,
         .schedule_bh = reims_vgpu_mmio_schedule_bh,
+        .notify_actions = reims_vgpu_mmio_notify_actions,
         .read_kva = reims_vgpu_shim_read_kva,
         .read_xreg = reims_vgpu_mmio_read_xreg,
         .map_pages = reims_vgpu_mmio_map_pages,
@@ -1168,6 +1247,16 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         return;
     }
     s->rust_handle = out.handle;
+
+    qemu_mutex_init(&s->drain_mutex);
+    qemu_cond_init(&s->drain_cond);
+    s->action_bh = aio_bh_new(qemu_get_aio_context(), reims_vgpu_mmio_action_bh,
+                              s);
+    s->drain_pending = false;
+    s->drain_stopping = false;
+    qemu_thread_create(&s->drain_thread, "reims-vgpu-drain",
+                       reims_vgpu_mmio_drain_thread, s, QEMU_THREAD_JOINABLE);
+    s->drain_thread_started = true;
 
     /*
      * Console only at realize (apple-gfx / archive apple-pv-gpu). Surface size
@@ -1222,6 +1311,17 @@ static void reims_vgpu_mmio_unrealize(DeviceState *dev)
         timer_free(s->poll_timer);
         s->poll_timer = NULL;
     }
+    if (s->drain_thread_started) {
+        qemu_mutex_lock(&s->drain_mutex);
+        s->drain_stopping = true;
+        qemu_cond_signal(&s->drain_cond);
+        qemu_mutex_unlock(&s->drain_mutex);
+        qemu_thread_join(&s->drain_thread);
+        s->drain_thread_started = false;
+        qemu_cond_destroy(&s->drain_cond);
+        qemu_mutex_destroy(&s->drain_mutex);
+    }
+    g_clear_pointer(&s->action_bh, qemu_bh_delete);
     if (s->rust_handle != 0) {
         reims_vgpu_qemu_window_stop(s->rust_handle);
         reims_vgpu_qemu_device_destroy(s->rust_handle);
