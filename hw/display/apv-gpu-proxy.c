@@ -1145,6 +1145,10 @@ static bool apv_mem_range(Int128 start, Int128 len, const MemoryRegion *mr,
     rb = qemu_ram_block_from_host(hva, false, &block_off);
     fd = rb ? qemu_ram_get_fd(rb) : -1;
     if (fd < 0 || scan->n == APV_PROXY_MAX_FDS) {
+        warn_report("apv-gpu-proxy: guest RAM 0x%" PRIx64 "+0x%" PRIx64
+                    " (%s) is not fd-backed and is invisible to the GPU "
+                    "backend", int128_get64(start), int128_get64(len),
+                    memory_region_name(mr));
         scan->skipped++;
         return false;
     }
@@ -1172,10 +1176,10 @@ static void apv_send_mem_table(ApvGpuProxyState *s)
         flatview_for_each_range(address_space_to_flatview(&address_space_memory),
                                 apv_mem_range, &scan);
     }
-    if (scan.skipped) {
-        warn_report("apv-gpu-proxy: %d guest RAM range(s) are not fd-backed "
-                    "and are invisible to the GPU backend (use "
-                    "memory-backend-memfd,share=on)", scan.skipped);
+    if (scan.n == 0) {
+        warn_report("apv-gpu-proxy: no fd-backed guest RAM; the GPU backend "
+                    "cannot reach guest memory (use memory-backend-memfd,"
+                    "share=on)");
     }
     msg.t.nr = scan.n;
     msg.t.generation = 1;
