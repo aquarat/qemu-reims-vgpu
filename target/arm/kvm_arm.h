@@ -212,6 +212,14 @@ int kvm_arm_get_max_vm_ipa_size(MachineState *ms, bool *fixed_ipa);
 int kvm_arm_vgic_probe(void);
 
 void kvm_arm_pmu_init(ARMCPU *cpu);
+
+/*
+ * vmapple guests: forward the platform's pointer-authentication hypercalls
+ * to userspace (at VM creation, for a vmapple machine) and serve them.
+ * kvm_arm_vmapple_hypercall returns true when it handled the exit.
+ */
+int kvm_arm_vmapple_init(MachineState *ms, KVMState *s);
+bool kvm_arm_vmapple_hypercall(CPUState *cs, struct kvm_run *run, int *ret);
 void kvm_arm_pmu_set_irq(ARMCPU *cpu, int irq);
 
 /**
