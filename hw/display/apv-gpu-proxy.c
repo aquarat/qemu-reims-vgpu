@@ -1198,6 +1198,92 @@ static void apv_machine_done(Notifier *notifier, void *data)
 }
 
 /* ---------- lifecycle ---------- */
+/*
+ * Drop everything the lost backend gave us, then connect to its successor
+ * (the launcher restarts it) and hand it guest RAM again. Used on guest reset
+ * with on-backend-loss=reset: the guest's GPU state died with the old process,
+ * so it starts again from a reset device. Main loop, BQL held.
+ */
+static bool apv_reconnect(ApvGpuProxyState *s, Error **errp)
+{
+    int i, tries;
+
+    if (s->con) {
+        s->surface = qemu_create_displaysurface(1920, 1080);
+        qemu_console_set_surface(s->con, s->surface);
+        memset(&s->shown, 0, sizeof(s->shown));
+    }
+    if (s->page) {
+        munmap(s->page, s->page_size);
+        s->page = NULL;
+    }
+    if (s->scanout) {
+        munmap(s->scanout, s->scanout_size);
+        s->scanout = NULL;
+    }
+    if (s->dirty) {
+        munmap(s->dirty, s->dirty_size);
+        s->dirty = NULL;
+    }
+    s->ring = NULL;
+    if (s->ev_fd >= 0) {
+        qemu_set_fd_handler(s->ev_fd, NULL, NULL, NULL);
+        close(s->ev_fd);
+        s->ev_fd = -1;
+    }
+    for (i = 0; i < APV_NR_IRQS; i++) {
+        if (s->irq_fd[i] >= 0) {
+            qemu_set_fd_handler(s->irq_fd[i], NULL, NULL, NULL);
+            close(s->irq_fd[i]);
+            s->irq_fd[i] = -1;
+        }
+    }
+    if (s->kick_fd >= 0) {
+        close(s->kick_fd);
+        s->kick_fd = -1;
+    }
+    if (s->ctl_fd >= 0) {
+        close(s->ctl_fd);
+        s->ctl_fd = -1;
+    }
+    s->last_gen_reads = 0;
+    s->nr_behaviour = 0;
+    qatomic_set(&s->lost, false);
+    s->lost_reason[0] = 0;
+
+    /* The launcher restarts the backend; give it time to listen again. */
+    for (tries = 0; tries < 300; tries++) {
+        Error *local = NULL;
+
+        if (apv_connect(s, &local)) {
+            break;
+        }
+        if (s->ctl_fd >= 0) {
+            close(s->ctl_fd);
+            s->ctl_fd = -1;
+        }
+        if (tries == 299) {
+            error_propagate(errp, local);
+            return false;
+        }
+        error_free(local);
+        g_usleep(100 * 1000);
+    }
+    apv_send_mem_table(s);
+    if (qatomic_read(&s->lost)) {
+        error_setg(errp, "apv-gpu-proxy: new backend refused guest RAM: %s",
+                   s->lost_reason);
+        return false;
+    }
+    if (s->watchdog) {
+        s->heartbeat_seen_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        s->last_heartbeat = 0;
+        timer_mod(s->watchdog, s->heartbeat_seen_ms + 1000);
+    }
+    info_report("apv-gpu-proxy: reconnected to a new GPU backend");
+    return true;
+}
+
 
 static void apv_init(Object *obj)
 {
@@ -1288,6 +1374,15 @@ static void apv_reset(DeviceState *dev)
 
     for (i = 0; i < APV_NR_IRQS; i++) {
         qemu_set_irq(s->irq[i], 0);
+    }
+    if (qatomic_read(&s->lost) && s->on_loss && !strcmp(s->on_loss, "reset")) {
+        Error *err = NULL;
+
+        if (!apv_reconnect(s, &err)) {
+            error_report_err(err);
+            vm_stop(RUN_STATE_INTERNAL_ERROR);
+            return;
+        }
     }
     if (s->ctl_fd < 0 || qatomic_read(&s->lost)) {
         return;
