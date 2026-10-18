@@ -82,6 +82,10 @@ static uint64_t gicv2m_read(void *opaque, hwaddr offset,
     case V2M_MSI_TYPER:
         val = (s->base_spi + 32) << 16;
         val |= s->num_spi;
+        /*
+         * The macOS guest quirk, from Mohamed Mediouni's qemu-devel RFC v7
+         * vmapple series (patch 6).
+         */
         if (s->macos_compat) {
             val |= BIT(31);
         }

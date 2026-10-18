@@ -395,6 +395,11 @@ static void create_gic(VMAppleMachineState *vms, MemoryRegion *mem)
     }
 }
 
+/*
+ * The GICv2m MSI frame and its macOS quirk come from Mohamed Mediouni's
+ * qemu-devel RFC v7 series "vmapple: make it work on the latest macOS
+ * release" (patches 5 and 6), applied to this fork in e181197cc2.
+ */
 #define NUM_GICV2M_SPIS       128
 
 static void create_gicv2m(VMAppleMachineState *vms)
