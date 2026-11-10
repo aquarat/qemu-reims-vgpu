@@ -2005,6 +2005,40 @@ static void virtio_pci_pre_plugged(DeviceState *d, Error **errp)
 }
 
 /* This is called by virtio-bus just after the device is plugged. */
+/*
+ * Relink @pci_dev's standard capability list in ascending address order,
+ * keeping every capability at its offset and with its contents.
+ *
+ * pci_add_capability() links each new capability at the head, so a virtio
+ * device's list runs from high offsets to low (MSI-X, then the virtio
+ * capabilities downwards). macOS 27's virtio PCI transport is reported to
+ * loop forever on such a list (its cached and fallback capability lookups
+ * disagree), so the device never leaves status 0; macOS 26 walks it once.
+ * Taken from Anees Iqbal's d235e51310 in steelbrain/qemu-reims-vgpu
+ * without the Apple vendor capability that commit also adds.
+ */
+static void virtio_pci_link_capabilities_ascending(PCIDevice *pci_dev)
+{
+    uint8_t *config = pci_dev->config;
+    bool present[PCI_CONFIG_SPACE_SIZE] = { false };
+    unsigned offset, previous = PCI_CAPABILITY_LIST;
+
+    for (offset = config[PCI_CAPABILITY_LIST]; offset;
+         offset = config[offset + PCI_CAP_LIST_NEXT]) {
+        assert(offset >= PCI_CONFIG_HEADER_SIZE &&
+               offset < PCI_CONFIG_SPACE_SIZE && !present[offset]);
+        present[offset] = true;
+    }
+    for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
+         offset++) {
+        if (present[offset]) {
+            config[previous] = offset;
+            previous = offset + PCI_CAP_LIST_NEXT;
+        }
+    }
+    config[previous] = 0;
+}
+
 static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
 {
     VirtIOPCIProxy *proxy = VIRTIO_PCI(d);
@@ -2175,6 +2209,11 @@ static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
                 virtio_add_feature(&vdev->host_features, VIRTIO_F_SR_IOV);
             }
         }
+    }
+
+    /* Every standard capability exists by now (MSI-X was the last). */
+    if (proxy->flags & VIRTIO_PCI_FLAG_ASCENDING_CAPS) {
+        virtio_pci_link_capabilities_ascending(&proxy->pci_dev);
     }
 }
 
@@ -2422,6 +2461,8 @@ static const Property virtio_pci_properties[] = {
                     VIRTIO_PCI_FLAG_INIT_FLR_BIT, true),
     DEFINE_PROP_BIT("aer", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_AER_BIT, false),
+    DEFINE_PROP_BIT("x-ascending-capabilities", VirtIOPCIProxy, flags,
+                    VIRTIO_PCI_FLAG_ASCENDING_CAPS_BIT, false),
 };
 
 static void virtio_pci_dc_realize(DeviceState *qdev, Error **errp)

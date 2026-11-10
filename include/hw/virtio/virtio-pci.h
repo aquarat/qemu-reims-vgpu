@@ -39,6 +39,7 @@ enum {
     VIRTIO_PCI_FLAG_AER_BIT,
     VIRTIO_PCI_FLAG_ATS_PAGE_ALIGNED_BIT,
     VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET_BIT,
+    VIRTIO_PCI_FLAG_ASCENDING_CAPS_BIT,
 };
 
 /* Need to activate work-arounds for buggy guests at vmstate load. */
@@ -69,6 +70,13 @@ enum {
 
 /* Advanced Error Reporting capability */
 #define VIRTIO_PCI_FLAG_AER (1 << VIRTIO_PCI_FLAG_AER_BIT)
+
+/*
+ * Link the capability list in address order (macOS 27 guests).
+ * See virtio_pci_link_capabilities_ascending().
+ */
+#define VIRTIO_PCI_FLAG_ASCENDING_CAPS \
+  (1 << VIRTIO_PCI_FLAG_ASCENDING_CAPS_BIT)
 
 /* Page Aligned Address space Translation Service */
 #define VIRTIO_PCI_FLAG_ATS_PAGE_ALIGNED \

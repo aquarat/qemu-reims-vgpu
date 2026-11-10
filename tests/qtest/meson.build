@@ -291,6 +291,8 @@ qtests_aarch64 = \
    config_all_devices.has_key('CONFIG_ARM_VIRT') ?
    ['iommu-smmuv3-test'] : []) + \
   qtests_cxl +                                                                                  \
+  (config_all_devices.has_key('CONFIG_ARM_VIRT') and
+   config_all_devices.has_key('CONFIG_VIRTIO_PCI') ? ['virtio-pci-cap-order-test'] : []) + \
   ['arm-cpu-features',
    'numa-test',
    'boot-serial-test',

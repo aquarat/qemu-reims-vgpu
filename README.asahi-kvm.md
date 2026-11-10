@@ -51,6 +51,12 @@ that has it (6740a49344).
   machine wires the CPUs, PSCI and the register helper itself
   (5deca34b77, c9bd4dfb8f). His HVF-only changes (vGIC bases, NO_RAW cpregs,
   ISV=0 aborts) are reverted, so `target/arm/hvf/` is upstream's.
+- **The virtio capability order for macOS 27 guests**
+  (`x-ascending-capabilities` in `hw/virtio/virtio-pci.c`): the relinking
+  from Anees Iqbal's d235e51310 in steelbrain/qemu-reims-vgpu
+  (`reims-vgpu` branch), not its Apple vendor capability, whose "transport
+  encryption disabled" flag makes a macOS 26 image's data-protected files
+  unreadable.
 - **Left as they are:** the macOS-host-only `hw/display/apple-gfx*.m`
   (upstream's, plus the RFC v7 changes above). They are not built on Linux.
 
@@ -75,6 +81,13 @@ superseded as described above):
   inside the available ring (`x-fix-overlapping-used`, on for vmapple); fixes
   ~8 % of boots never reaching the network and ~4 % with no sound device.
 
+- `virtio-pci`: `x-ascending-capabilities` (default off) links a device's
+  PCI capability list in address order, keeping each capability's offset and
+  contents. macOS 27 guests are reported to need it on every virtio device;
+  turn it on for all of them with
+  `-global virtio-pci.x-ascending-capabilities=on`. Tested here: macOS 26
+  boots and runs with it on; macOS 27 itself is untested.
+
 - `hw/display`: `apv-gpu-proxy`, the out-of-process GPU device, replacing the
   in-process Reims shims; vmapple's `gfx-device` takes `apple-gfx-mmio`,
   `apv-gpu-proxy` or `none`.
@@ -97,6 +110,9 @@ git merge upstream/master
 steelbrain's branch carries the in-process Reims shims this fork removed; if a
 merge brings any back (`hw/display/reims-vgpu-*`, the cargo glue in
 `hw/display/meson.build`), drop them again.
+Do not take d235e51310's vendor capability in `hw/vmapple/virtio-blk.c` (the
+`PCI_CAP_ID_VNDR` with "transport encryption disabled") or its own relinking
+there; this fork's `x-ascending-capabilities` covers the order.
 
 Then build (`MODE=oop scripts/build-qemu.sh` in the experiment repository)
 and run the Ventura/Tahoe job loops before pushing.
