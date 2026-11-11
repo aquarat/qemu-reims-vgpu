@@ -30,7 +30,16 @@ qemu-system-aarch64 -M vmapple,gfx-device=apv-gpu-proxy,aux-ram-share=on \
 ```
 
 Guest RAM must be fd-backed and shared (`memory-backend-memfd,share=on`,
-`aux-ram-share=on`) so the backend can map it. The experiment repository's
+`aux-ram-share=on`) so the backend can map it.
+
+The device also offers the backend `/dev/udmabuf` when the backend asks for
+it (`APV_PROXY_UDMABUF`, feature bit `APV_PROXY_FEAT_UDMABUF`): the backend
+then makes dma-bufs of those memfds, a chunk at a time, and its GPU imports
+guest RAM instead of copying it. The fd grants nothing the backend does not
+already hold, and the backend needs no device node of its own. It is not
+offered when a memory balloon is present (a udmabuf pins its pages, so a page
+the guest gives back would go stale for the GPU), or with
+`-global apv-gpu-proxy.udmabuf=off`. QEMU logs one line saying which. The experiment repository's
 `launch-kvm.sh` does all of this when `GPU_BACKEND_BIN` is set.
 
 The in-process Reims device (`reims-vgpu-mmio`, Reims linked into QEMU as a
@@ -87,6 +96,10 @@ superseded as described above):
   turn it on for all of them with
   `-global virtio-pci.x-ascending-capabilities=on`. Tested here: macOS 26
   boots and runs with it on; macOS 27 itself is untested.
+
+- `hw/display/apv-gpu-proxy`: offer the backend `/dev/udmabuf` (property
+  `udmabuf`, default on; never with a balloon), so its GPU imports guest RAM
+  as dma-bufs.
 
 - `hw/display`: `apv-gpu-proxy`, the out-of-process GPU device, replacing the
   in-process Reims shims; vmapple's `gfx-device` takes `apple-gfx-mmio`,

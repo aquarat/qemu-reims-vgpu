@@ -43,6 +43,9 @@
  *  - eventfds: kick (frontend -> backend: posted work or doorbells), and one
  *    per interrupt line (backend -> frontend, or straight into a KVM irqfd).
  *  - guest RAM, as the frontend's own memory-backend fds (MEM_TABLE).
+ *  - optionally, an open /dev/udmabuf (UDMABUF), with which the backend makes
+ *    dma-bufs of those memfds for its GPU. It grants no access to memory the
+ *    backend does not already hold, and needs no device node in its sandbox.
  *
  * Every multi-byte field is little-endian and naturally aligned. Shared-page
  * words are accessed with atomic operations by both processes.
@@ -79,6 +82,7 @@ typedef struct ApvProxyHdr {
 #define APV_PROXY_WRITE 4u
 #define APV_PROXY_RESET 5u
 #define APV_PROXY_SHUTDOWN 6u  /* no reply */
+#define APV_PROXY_UDMABUF 7u   /* only if the backend set APV_PROXY_FEAT_UDMABUF */
 
 /* ---- callbacks, backend -> frontend, control socket, inside READ/WRITE ---- */
 #define APV_PROXY_CB_XREGS 16u
@@ -168,6 +172,9 @@ typedef struct ApvProxyHelloReply {
     uint32_t reserved;
 } ApvProxyHelloReply;
 
+/* HELLO reply features. */
+#define APV_PROXY_FEAT_UDMABUF 0x1u  /* the backend takes a UDMABUF request */
+
 #define APV_PROXY_FD_DEVICE_PAGE 0u
 #define APV_PROXY_FD_KICK 1u
 #define APV_PROXY_FD_EVENTS 2u
@@ -189,6 +196,23 @@ typedef struct ApvProxyMemTable {
     uint32_t generation;
     /* ApvProxyMemRegion regions[nr]; */
 } ApvProxyMemTable;
+
+/*
+ * UDMABUF: one fd, an open /dev/udmabuf, and the udmabuf module's limits as
+ * the frontend read them (/sys/module/udmabuf/parameters): the largest single
+ * dma-buf in bytes, and the most entries one UDMABUF_CREATE_LIST may take.
+ * Sent after HELLO and before MEM_TABLE, at most once per connection, and only
+ * when the backend set APV_PROXY_FEAT_UDMABUF. The backend makes dma-bufs of
+ * the MEM_TABLE memfds with it, as it needs them, and pins only those pages; a
+ * frontend withholds it when guest pages can be taken back under it (a memory
+ * balloon). The reply carries ApvProxyValue; an error reply means the backend
+ * will not use it and copies guest memory instead.
+ */
+typedef struct ApvProxyUdmabuf {
+    uint64_t size_limit;
+    uint32_t list_limit;
+    uint32_t flags;   /* 0 */
+} ApvProxyUdmabuf;
 
 /* READ / WRITE. A READ reply carries ApvProxyValue. */
 typedef struct ApvProxyAccess {
@@ -347,6 +371,7 @@ _Static_assert(sizeof(ApvProxyBehaviour) == 16, "ApvProxyBehaviour");
 _Static_assert(sizeof(ApvProxyHelloReply) == 48, "ApvProxyHelloReply");
 _Static_assert(sizeof(ApvProxyMemRegion) == 32, "ApvProxyMemRegion");
 _Static_assert(sizeof(ApvProxyMemTable) == 8, "ApvProxyMemTable");
+_Static_assert(sizeof(ApvProxyUdmabuf) == 16, "ApvProxyUdmabuf");
 _Static_assert(sizeof(ApvProxyAccess) == 24, "ApvProxyAccess");
 _Static_assert(sizeof(ApvProxyXregs) == 256, "ApvProxyXregs");
 _Static_assert(sizeof(ApvProxyXlateReply) == 16, "ApvProxyXlateReply");

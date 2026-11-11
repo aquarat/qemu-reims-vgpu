@@ -58,6 +58,7 @@
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "hw/vmapple/vmapple.h"
+#include "hw/virtio/virtio-balloon.h"
 #include "hw/display/apv-gpu-proxy-protocol.h"
 
 #define TYPE_APV_GPU_PROXY "apv-gpu-proxy"
@@ -142,6 +143,10 @@ struct ApvGpuProxyState {
 
     Notifier machine_done;
     Error *migration_blocker;
+
+    /* udmabuf: offer /dev/udmabuf to a backend that asks (APV_PROXY_FEAT_UDMABUF) */
+    bool udmabuf;              /* property */
+    uint32_t backend_features; /* from the last HELLO reply */
 };
 
 /* ---------- loss ---------- */
@@ -1070,6 +1075,7 @@ static bool apv_connect(ApvGpuProxyState *s, Error **errp)
         error_setg(errp, "apv-gpu-proxy: malformed HELLO reply");
         goto out;
     }
+    s->backend_features = rep.r.features;
     s->page_size = rep.r.device_page_size;
     s->scanout_size = rep.r.scanout_size;
     s->dirty_size = rep.r.dirty_size;
@@ -1162,6 +1168,71 @@ static bool apv_mem_range(Int128 start, Int128 len, const MemoryRegion *mr,
     return false;
 }
 
+/*
+ * Offer the backend /dev/udmabuf, with which it makes dma-bufs of the guest-RAM
+ * memfds MEM_TABLE gives it, a chunk at a time, for its GPU to import instead
+ * of copying guest memory. The fd lets it do nothing to memory it does not
+ * already hold, and it needs no device node of its own. Not offered when a
+ * memory balloon exists: a udmabuf pins its pages, so a page the guest gives
+ * back would stay pinned and go stale for the GPU. Before MEM_TABLE, once per
+ * connection; a refusal (or no offer) leaves the backend copying.
+ */
+static void apv_offer_udmabuf(ApvGpuProxyState *s)
+{
+    ApvProxyUdmabuf msg = { 0 };
+    ApvProxyValue v;
+    g_autofree char *size_mb = NULL, *list = NULL;
+    bool ambiguous = false;
+    int fd;
+    ssize_t n;
+
+    if (!s->udmabuf) {
+        info_report("apv-gpu-proxy: udmabuf=off: the GPU backend copies guest RAM");
+        return;
+    }
+    if (!(s->backend_features & APV_PROXY_FEAT_UDMABUF)) {
+        info_report("apv-gpu-proxy: the GPU backend does not take udmabufs: "
+                    "it copies guest RAM");
+        return;
+    }
+    if (object_resolve_path_type("", TYPE_VIRTIO_BALLOON, &ambiguous) || ambiguous) {
+        info_report("apv-gpu-proxy: a memory balloon is present: guest RAM is "
+                    "not offered as udmabufs (pinned pages would go stale); "
+                    "the GPU backend copies it");
+        return;
+    }
+    fd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        info_report("apv-gpu-proxy: /dev/udmabuf: %s: the GPU backend copies "
+                    "guest RAM", strerror(errno));
+        return;
+    }
+    if (!g_file_get_contents("/sys/module/udmabuf/parameters/size_limit_mb",
+                             &size_mb, NULL, NULL) ||
+        !g_file_get_contents("/sys/module/udmabuf/parameters/list_limit",
+                             &list, NULL, NULL)) {
+        info_report("apv-gpu-proxy: cannot read the udmabuf limits: the GPU "
+                    "backend copies guest RAM");
+        close(fd);
+        return;
+    }
+    msg.size_limit = g_ascii_strtoull(size_mb, NULL, 10) << 20;
+    msg.list_limit = (uint32_t)g_ascii_strtoull(list, NULL, 10);
+    qemu_mutex_lock(&s->ctl_lock);
+    n = apv_exchange(s, APV_PROXY_UDMABUF, &msg, sizeof(msg), &fd, 1,
+                     &v, sizeof(v), NULL, 0, NULL);
+    qemu_mutex_unlock(&s->ctl_lock);
+    close(fd);
+    if (n < 0) {
+        info_report("apv-gpu-proxy: the GPU backend refused /dev/udmabuf (%zd): "
+                    "it copies guest RAM", n);
+        return;
+    }
+    info_report("apv-gpu-proxy: guest RAM offered to the GPU backend as "
+                "udmabufs (size limit %" PRIu64 " MiB, list limit %u)",
+                msg.size_limit >> 20, msg.list_limit);
+}
+
 static void apv_send_mem_table(ApvGpuProxyState *s)
 {
     struct {
@@ -1198,6 +1269,7 @@ static void apv_machine_done(Notifier *notifier, void *data)
 {
     ApvGpuProxyState *s = container_of(notifier, ApvGpuProxyState, machine_done);
 
+    apv_offer_udmabuf(s);
     apv_send_mem_table(s);
 }
 
@@ -1273,6 +1345,7 @@ static bool apv_reconnect(ApvGpuProxyState *s, Error **errp)
         error_free(local);
         g_usleep(100 * 1000);
     }
+    apv_offer_udmabuf(s);
     apv_send_mem_table(s);
     if (qatomic_read(&s->lost)) {
         error_setg(errp, "apv-gpu-proxy: new backend refused guest RAM: %s",
@@ -1405,6 +1478,7 @@ static const Property apv_properties[] = {
     DEFINE_PROP_UINT32("sync-timeout-ms", ApvGpuProxyState, sync_timeout_ms,
                        30000),
     DEFINE_PROP_UINT32("watchdog-ms", ApvGpuProxyState, watchdog_ms, 60000),
+    DEFINE_PROP_BOOL("udmabuf", ApvGpuProxyState, udmabuf, true),
 };
 
 static void apv_class_init(ObjectClass *klass, const void *data)
