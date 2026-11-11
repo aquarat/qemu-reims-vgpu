@@ -32,17 +32,16 @@ qemu-system-aarch64 -M vmapple,gfx-device=apv-gpu-proxy,aux-ram-share=on \
 Guest RAM must be fd-backed and shared (`memory-backend-memfd,share=on`,
 `aux-ram-share=on`) so the backend can map it.
 
-With `-global apv-gpu-proxy.udmabuf=on` (off by default: on Honeykrisp a
-12 GB guest's SwiftUI UI test hung its GPU work with it on, see below), the
-device offers the backend `/dev/udmabuf` when the backend asks for
-it (`APV_PROXY_UDMABUF`, feature bit `APV_PROXY_FEAT_UDMABUF`): the backend
-then makes dma-bufs of those memfds, a chunk at a time, and its GPU imports
-guest RAM instead of copying it. The fd grants nothing the backend does not
-already hold, and the backend needs no device node of its own. It is not
-offered when a memory balloon is present (a udmabuf pins its pages, so a page
-the guest gives back would go stale for the GPU). QEMU logs one line saying
-which. The experiment repository's `launch-kvm.sh` does all of this when
-`GPU_BACKEND_BIN` is set, and turns the offer on with `GPU_UDMABUF=1`.
+With `-global apv-gpu-proxy.udmabuf=on` (off by default), the device offers
+the backend `/dev/udmabuf` when the backend asks for it (`APV_PROXY_UDMABUF`,
+feature bit `APV_PROXY_FEAT_UDMABUF`): the backend then makes dma-bufs of
+those memfds, a chunk at a time, and its GPU imports guest RAM instead of
+copying it. The fd grants nothing the backend does not already hold, and the
+backend needs no device node of its own. It is not offered when a memory
+balloon is present (a udmabuf pins its pages, so a page the guest gives back
+would go stale for the GPU). QEMU logs one line saying which. The experiment
+repository's `launch-kvm.sh` does all of this when `GPU_BACKEND_BIN` is set,
+and turns the offer on with `GPU_UDMABUF=1`.
 
 The in-process Reims device (`reims-vgpu-mmio`, Reims linked into QEMU as a
 Rust staticlib) is no longer in this branch. aquarat/reims-vgpu still builds it
@@ -101,9 +100,8 @@ superseded as described above):
 
 - `hw/display/apv-gpu-proxy`: offer the backend `/dev/udmabuf` (property
   `udmabuf`, default off; never with a balloon), so its GPU imports guest
-  RAM as dma-bufs. Opt-in until the GPU hang it causes in the 12 GB SwiftUI
-  UI test on Honeykrisp is understood (simulator unit tests, texture and
-  seam-crossing probes and the copy fallbacks all pass with it on).
+  RAM as dma-bufs. Every page the GPU touches stays pinned while the guest
+  runs, which in practice is all of guest RAM.
 
 - `hw/display`: `apv-gpu-proxy`, the out-of-process GPU device, replacing the
   in-process Reims shims; vmapple's `gfx-device` takes `apple-gfx-mmio`,
