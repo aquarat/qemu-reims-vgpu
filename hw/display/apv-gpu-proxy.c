@@ -1187,7 +1187,8 @@ static void apv_offer_udmabuf(ApvGpuProxyState *s)
     ssize_t n;
 
     if (!s->udmabuf) {
-        info_report("apv-gpu-proxy: udmabuf=off: the GPU backend copies guest RAM");
+        info_report("apv-gpu-proxy: udmabuf=off (the default): the GPU "
+                    "backend copies guest RAM");
         return;
     }
     if (!(s->backend_features & APV_PROXY_FEAT_UDMABUF)) {
@@ -1478,7 +1479,7 @@ static const Property apv_properties[] = {
     DEFINE_PROP_UINT32("sync-timeout-ms", ApvGpuProxyState, sync_timeout_ms,
                        30000),
     DEFINE_PROP_UINT32("watchdog-ms", ApvGpuProxyState, watchdog_ms, 60000),
-    DEFINE_PROP_BOOL("udmabuf", ApvGpuProxyState, udmabuf, true),
+    DEFINE_PROP_BOOL("udmabuf", ApvGpuProxyState, udmabuf, false),
 };
 
 static void apv_class_init(ObjectClass *klass, const void *data)
