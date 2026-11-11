@@ -188,7 +188,16 @@ static void apv_loss_bh(void *opaque)
     if (!strcmp(s->on_loss, "shutdown")) {
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_ERROR);
     } else if (!strcmp(s->on_loss, "reset")) {
-        qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_ERROR);
+        /*
+         * SUBSYSTEM_RESET because it is the one cause -no-reboot does not
+         * turn into a shutdown, and jobs run with -no-reboot so that a guest
+         * that reboots ends its job. On this machine it is the same cold
+         * reset as any other cause (qemu_system_reset() keys only snapshot
+         * loads off the cause, and nothing here rebuilds the KVM VM); what
+         * it leaves out is the QMP RESET event, so the line above is the
+         * record of this reset. The guest's own reboots still shut down.
+         */
+        qemu_system_reset_request(SHUTDOWN_CAUSE_SUBSYSTEM_RESET);
     } else {
         vm_stop(RUN_STATE_INTERNAL_ERROR);
     }

@@ -20,7 +20,10 @@ socket, a shared memfd and eventfds
 metal2vulkan, Rust or Vulkan is built into or loaded by this QEMU. A crash in
 the host GPU driver ends only the backend: the device stops the guest with the
 reason (`on-backend-loss=stop`, the default), or resets it onto a fresh
-backend (`reset`).
+backend (`reset`). That reset is requested as a subsystem reset, which
+`-no-reboot` does not turn into a shutdown: a guest run with `-no-reboot`
+survives losing its backend, and a reboot by the guest itself still ends it.
+QMP sees no `RESET` event for it.
 
 ```sh
 reims-vgpu-backend --socket /run/gpu.sock &
